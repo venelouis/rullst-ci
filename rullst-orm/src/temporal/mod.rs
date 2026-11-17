@@ -195,3 +195,17 @@ mod tests;
 #[cfg(test)]
 #[path = "support_tests.rs"]
 pub(crate) mod test_support;
+
+// REVIEW-ONLY (PR #754 review, local, not for merge).
+#[cfg(test)]
+#[path = "review_parse.rs"]
+mod review_parse;
+#[cfg(all(test, any(feature = "drivers-all", feature = "strict-postgres", feature = "pgvector")))]
+#[path = "review_postgres.rs"]
+mod review_postgres;
+#[cfg(all(test, any(feature = "drivers-all", feature = "strict-mysql")))]
+#[path = "review_mysql.rs"]
+mod review_mysql;
+#[cfg(all(test, any(feature = "drivers-all", feature = "strict-sqlite", feature = "turso")))]
+#[path = "review_sqlite.rs"]
+mod review_sqlite;

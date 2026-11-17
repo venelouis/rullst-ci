@@ -1,0 +1,142 @@
+# REVIEW-ONLY scratch workflow (PR #754 review in the maintainer's fork; not for merge).
+name: review-754
+
+on:
+  push:
+    branches: ["review/pr754-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  features:
+    name: clippy rullst-orm lib (${{ matrix.features || 'no features' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - strict-sqlite
+          - strict-postgres
+          - strict-mysql
+          - drivers-all
+          - turso
+          - pgvector
+          - redis
+          - strict-mysql,strict-sqlite
+          - strict-sqlite,redis
+          - strict-mysql,redis
+          - drivers-all,strict-mysql
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: 1.100.0
+          components: clippy
+      - name: Clippy, production code only
+        run: cargo clippy -p rullst-orm --no-default-features --features "${{ matrix.features }}" --lib --locked -- -D warnings
+      - name: The PR's own date/time unit tests under this feature set
+        run: cargo test -p rullst-orm --no-default-features --features "${{ matrix.features }}" --lib --locked -- temporal field_kind bind_field --skip review_ --test-threads=2
+
+  live:
+    name: live binary and text protocol reads
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres@sha256:29342cb52157b098821961d2c14eec3c019071f56a5d559e990cf07cf541ea9b
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready --host=127.0.0.1 --username=postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+      mysql:
+        image: mysql@sha256:76f0358884cb92d9a086d24e5671c38048d3fef40f2588703d73eb55392d6b69
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping --host=127.0.0.1 --protocol=tcp --silent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+      mariadb:
+        image: mariadb:11.4@sha256:d1891ede5a559f1086f55053bb8cc1569b0298338c4d72d71725a7f74f6ba620
+        env:
+          MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: "1"
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd "mariadb-admin ping --host=127.0.0.1 --protocol=tcp --silent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      REVIEW_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+      REVIEW_MYSQL_URL: mysql://root@127.0.0.1:3306/mysql
+      REVIEW_MARIADB_URL: mysql://root@127.0.0.1:3307/mysql
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: 1.100.0
+      - name: Live reads and writes, both protocols
+        run: cargo test -p rullst-orm --features drivers-all --locked --test review_754_live -- --test-threads=1 --nocapture
+      - name: Review differential unit tests (300k cases each)
+        run: cargo test -p rullst-orm --features drivers-all,redis --locked --lib -- temporal::review_ --test-threads=2 --nocapture
+
+  mariadb-strict:
+    # CI runs matrix_mariadb only with drivers-all (the Any pool), where the
+    # jiff contract returns early; this runs it with the strict MySQL pool,
+    # and again with the MariaDB DATETIME wire for jiff instants removed.
+    name: strict-mysql ${{ matrix.test }} (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: pr, test: matrix_mariadb }
+          - { variant: wire-removed, test: matrix_mysql }
+          - { variant: wire-removed, test: matrix_mariadb }
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+      RULLST_REQUIRE_TESTCONTAINERS: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: 1.100.0
+      - name: Remove the MariaDB wire for jiff instants (mutant)
+        if: matrix.variant == 'wire-removed'
+        run: |
+          python3 - <<'EOF'
+          from pathlib import Path
+          p = Path("rullst-orm/src/bind_field.rs")
+          s = p.read_text()
+          a = s.count("pub type TimestampWire = crate::DateTime;")
+          b = s.count("crate::DateTime::from(crate::temporal::text::utc(*value))")
+          assert a == 1 and b == 1, (a, b)
+          s = s.replace("pub type TimestampWire = crate::DateTime;", "pub type TimestampWire = crate::Timestamp;")
+          s = s.replace("crate::DateTime::from(crate::temporal::text::utc(*value))", "value")
+          p.write_text(s)
+          EOF
+          git diff --stat
+      - name: Run the matrix with the strict MySQL pool
+        run: cargo test -p rullst-orm --no-default-features --features strict-mysql --locked --test ${{ matrix.test }} -- --test-threads=1
