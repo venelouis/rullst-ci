@@ -1,0 +1,14 @@
+name: Scratch cron crosscheck
+on:
+  push:
+    branches: [scratch/jiff-cli-cron-crosscheck]
+permissions:
+  contents: read
+jobs:
+  crosscheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cross-check
+        run: cargo test -p rullst-messaging --features schedules-postgres --lib crosscheck -- --nocapture 2>&1 | tee out.txt; sed -n '/CROSSCHECK/,/END/p' out.txt

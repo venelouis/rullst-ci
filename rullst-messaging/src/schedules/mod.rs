@@ -61,3 +61,5 @@ fn current(clock: &impl Clock) -> Result<i64> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod crosscheck_tests;
