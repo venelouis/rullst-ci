@@ -115,7 +115,7 @@ async fn review_postgres_binary_and_text_reads_match_chrono() {
     .unwrap();
     let mut bad = Vec::new();
     for zone in ["UTC", "America/Sao_Paulo", "Pacific/Chatham", "America/St_Johns", "Europe/Amsterdam"] {
-        sqlx::raw_sql(&format!("SET TIME ZONE '{zone}'"))
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET TIME ZONE '{zone}'")))
             .execute(&mut conn)
             .await
             .unwrap();
