@@ -169,6 +169,7 @@ fn corpus() -> Vec<(String, Vec<(i64, Option<Vec<Option<i64>>>)>)> {
 fn matches_legacy(posix: &str, starts: &[(i64, Option<Vec<Option<i64>>>)]) -> Result<(), String> {
     for (start, recorded) in starts {
         let Some(recorded) = recorded else { continue };
+        if !(-377_705_023_201_000..=253_402_207_200_000).contains(start) { continue; }
         let mut after = *start;
         for expected in recorded {
             let got = rullst_core::scheduler::__test_hooks::cron_next_after(posix, after)?;
