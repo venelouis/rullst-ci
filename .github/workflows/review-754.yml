@@ -13,6 +13,7 @@ env:
 
 jobs:
   features:
+    if: false # running in the previous probe2 run
     name: clippy rullst-orm lib (${{ matrix.features || 'no features' }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -100,6 +101,7 @@ jobs:
         run: cargo test -p rullst-orm --features drivers-all,redis --locked --lib -- temporal::review_ --test-threads=2 --nocapture
 
   mariadb-strict:
+    if: false # running in the previous probe2 run
     # CI runs matrix_mariadb only with drivers-all (the Any pool), where the
     # jiff contract returns early; this runs it with the strict MySQL pool,
     # and again with the MariaDB DATETIME wire for jiff instants removed.
