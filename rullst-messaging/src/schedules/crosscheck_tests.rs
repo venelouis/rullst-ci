@@ -136,34 +136,84 @@ fn mine(expression: &str) -> Option<String> {
     }
 }
 
+/// The recorded legacy occurrences: (expression, [(start, Some(results) | None for error)]).
+fn corpus() -> Vec<(String, Vec<(i64, Option<Vec<Option<i64>>>)>)> {
+    let mut out: Vec<(String, Vec<(i64, Option<Vec<Option<i64>>>)>)> = Vec::new();
+    let mut current: Option<(String, Vec<(i64, Option<Vec<Option<i64>>>)>)> = None;
+    for line in VECTORS.lines() {
+        if line.starts_with('#') || line.is_empty() { continue; }
+        if let Some(rest) = line.strip_prefix('\t') {
+            let Some((start, results)) = rest.split_once('\t') else { continue };
+            let start: i64 = start.parse().unwrap();
+            let parsed = if results.trim() == "error" { None } else {
+                let mut list = Vec::new();
+                for token in results.split_whitespace() {
+                    if token == "end" { list.push(None); break; }
+                    if token == "error" { break; }
+                    list.push(Some(token.parse::<i64>().unwrap()));
+                }
+                Some(list)
+            };
+            if let Some((_, starts)) = current.as_mut() { starts.push((start, parsed)); }
+            continue;
+        }
+        if let Some(done) = current.take() { out.push(done); }
+        let (expression, verdict) = line.rsplit_once('\t').unwrap();
+        current = (verdict == "ok").then(|| (expression.to_string(), Vec::new()));
+    }
+    if let Some(done) = current.take() { out.push(done); }
+    out
+}
+
+/// Whether `posix` (Core's evaluator) reproduces every recorded start.
+fn matches_legacy(posix: &str, starts: &[(i64, Option<Vec<Option<i64>>>)]) -> Result<(), String> {
+    for (start, recorded) in starts {
+        let Some(recorded) = recorded else { continue };
+        let mut after = *start;
+        for expected in recorded {
+            let got = rullst_core::scheduler::__test_hooks::cron_next_after(posix, after)?;
+            if got != *expected { return Err(format!("start {start}: expected {expected:?} got {got:?}")); }
+            match got { Some(at) => after = at, None => break }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn crosscheck_cli_note_against_posix_equivalent() {
     let mut agree = 0;
     let mut both_none = 0;
     let mut disagree = Vec::new();
-    let mut mine_extra = Vec::new();
-    let mut mine_missing = Vec::new();
-    let mut total = 0;
-    for line in VECTORS.lines() {
-        if line.starts_with('#') || line.starts_with('\t') || line.is_empty() { continue; }
-        let Some((expression, verdict)) = line.rsplit_once('\t') else { continue };
-        if verdict != "ok" { continue; }
-        total += 1;
+    let mut mine_extra = 0;
+    let mut mine_missing = 0;
+    let mut mine_wrong = Vec::new();
+    let mut theirs_wrong = Vec::new();
+    let mut mine_checked = 0;
+    let corpus = corpus();
+    for (expression, starts) in &corpus {
+        let expression = expression.as_str();
         let theirs = super::cron_expression::Schedule::parse_five_fields(expression).and_then(|s| s.posix_equivalent());
         let mine = mine(expression);
+        if let Some(m) = &mine {
+            mine_checked += 1;
+            if let Err(why) = matches_legacy(m, starts) { mine_wrong.push(format!("{expression:?}: mine {m:?}: {why}; note {:?}", advice(expression))); }
+        }
+        if let Some(t) = &theirs {
+            if let Err(why) = matches_legacy(t, starts) { theirs_wrong.push(format!("{expression:?}: theirs {t:?}: {why}")); }
+        }
         match (&theirs, &mine) {
             (None, None) => both_none += 1,
             (Some(t), Some(m)) => {
                 let same = STARTS.iter().all(|start| occurrences(t, *start) == occurrences(m, *start));
-                if same { agree += 1 } else { disagree.push(format!("{expression:?}: theirs {t:?} mine {m:?} note {:?}", advice(expression))) }
+                if same { agree += 1 } else { disagree.push(format!("{expression:?}: theirs {t:?} mine {m:?}")) }
             }
-            (None, Some(m)) => mine_extra.push(format!("{expression:?}: mine {m:?} note {:?}", advice(expression))),
-            (Some(t), None) => mine_missing.push(format!("{expression:?}: theirs {t:?} note {:?}", advice(expression))),
+            (None, Some(_)) => mine_extra += 1,
+            (Some(_), None) => mine_missing += 1,
         }
     }
     let show = |items: &Vec<String>| items.iter().take(40).cloned().collect::<Vec<_>>().join("\n");
     panic!(
-        "CROSSCHECK total={total} agree={agree} both_none={both_none} disagree={} mine_extra={} mine_missing={}\n--- disagree\n{}\n--- mine_extra\n{}\n--- mine_missing\n{}\nEND",
-        disagree.len(), mine_extra.len(), mine_missing.len(), show(&disagree), show(&mine_extra), show(&mine_missing)
+        "CROSSCHECK total={} agree={agree} both_none={both_none} disagree={} mine_extra={mine_extra} mine_missing={mine_missing} mine_checked_against_legacy={mine_checked} mine_wrong={} theirs_wrong={}\n--- disagree\n{}\n--- mine_wrong\n{}\n--- theirs_wrong\n{}\nEND",
+        corpus.len(), disagree.len(), mine_wrong.len(), theirs_wrong.len(), show(&disagree), show(&mine_wrong), show(&theirs_wrong)
     );
 }
