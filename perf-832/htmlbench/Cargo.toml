@@ -1,0 +1,15 @@
+[package]
+name = "htmlbench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rullst = { version = "=13.0.0-rc.1", default-features = false }
+askama = "0.16"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[workspace]

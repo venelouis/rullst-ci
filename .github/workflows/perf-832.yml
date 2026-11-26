@@ -184,6 +184,35 @@ jobs:
           name: updates
           path: out/
 
+  htmlbench:
+    needs: plan
+    if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-htmlbench]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Render /fortunes with html!, Askama and a plain String, counting allocations
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          image=rust:1.99.1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd
+          docker run --rm -v "$PWD/perf-832/htmlbench:/src" -w /src -e CARGO_TARGET_DIR=/src/target "$image" \
+            cargo build --release 2>&1 | tail -5
+          nproc; lscpu | grep -i "model name"
+          for run in 1 2 3; do
+            echo "== run $run" | tee -a out/htmlbench.txt
+            docker run --rm --cpuset-cpus 0 -v "$PWD/perf-832/htmlbench:/src" -w /src "$image" /src/target/release/htmlbench | tee -a out/htmlbench.txt
+          done
+          docker run --rm "$image" cargo --version | tee -a out/htmlbench.txt
+          grep -A3 'name = "rullst"$\|name = "askama"$\|name = "rullst-core"$' perf-832/htmlbench/Cargo.lock | tee -a out/htmlbench.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: htmlbench
+          path: out/
+
   extras:
     needs: [plan, build]
     if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-extras]') }}
