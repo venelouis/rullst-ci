@@ -260,6 +260,10 @@ def profile(args) -> None:
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
     meta = {"mode": "profile", "env": environment(ctx), "profiles": []}
+    # Kernel symbols of this boot (KASLR): perf script resolves kernel frames with them.
+    kallsyms = (outdir / "kallsyms.txt").resolve()
+    with kallsyms.open("w") as handle:
+        run(["sudo", "cat", "/proc/kallsyms"], stdout=handle)
     try:
         for target in args.targets.split(","):
             variant, path = target.split("=", 1)
@@ -278,11 +282,12 @@ def profile(args) -> None:
                      "-o", str(perf_data), "--", "sleep", str(args.seconds)], stderr=subprocess.PIPE)
                 thread.join()
                 symfs = (Path(args.symfs) / VARIANTS[variant][0]).resolve()
+                run(["sudo", "chmod", "a+r", str(perf_data)])
                 script = outdir / f"{label}.perf.txt"
                 status = "ok"
                 try:
                     with script.open("w") as handle:
-                        run(["sudo", "perf", "script", "--no-inline", "-i", str(perf_data), "--symfs", str(symfs)],
+                        run(["perf", "script", "--no-inline", "-i", str(perf_data), "--symfs", str(symfs), "--kallsyms", str(kallsyms)],
                             stdout=handle, stderr=subprocess.PIPE)
                     folded = outdir / f"{label}.folded"
                     with script.open() as source, folded.open("w") as handle:

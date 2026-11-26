@@ -230,9 +230,9 @@ jobs:
             cid="$(docker create "bench/$image:local")"
             mkdir -p "symfs/$image/app" bin
             docker cp "$cid:/app/server" "symfs/$image/app/server"
-            mkdir -p "symfs/$image/usr/lib"
+            mkdir -p "symfs/$image/usr/lib" "symfs/$image/lib"
             docker cp "$cid:/usr/lib/x86_64-linux-gnu" "symfs/$image/usr/lib/x86_64-linux-gnu"
-            ln -sfn usr/lib "symfs/$image/lib"
+            docker cp "$cid:/lib/x86_64-linux-gnu" "symfs/$image/lib/x86_64-linux-gnu"
             cp "symfs/$image/app/server" "bin/$image"
             docker rm "$cid" > /dev/null
           done
