@@ -67,6 +67,7 @@ jobs:
 
   layers:
     needs: [plan, build]
+    if: ${{ !contains(github.event.head_commit.message, '[only-profile]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
@@ -107,6 +108,7 @@ jobs:
 
   fortunes:
     needs: [plan, build]
+    if: ${{ !contains(github.event.head_commit.message, '[only-profile]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -142,6 +144,7 @@ jobs:
 
   updates:
     needs: [plan, build]
+    if: ${{ !contains(github.event.head_commit.message, '[only-profile]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -213,7 +216,7 @@ jobs:
           perf --version
           apt-cache policy heaptrack | head -3
           cargo install inferno --version 0.12.8 --locked
-          inferno-flamegraph --version
+          cargo install --list | grep inferno
           heaptrack_print --help | head -40
       - name: Setup
         env:
@@ -238,7 +241,7 @@ jobs:
           python3 perf-832/drive.py profile --symfs symfs --out out/profile
           --targets "rullst-p=/text,minimal-p=/text,rullst-p=/fortunes,minimal-p=/fortunes,axum-p=/fortunes,rullst-p=/updates?queries=20,axum-p=/updates?queries=20"
       - name: Allocation profiles (heaptrack)
-        if: always()
+        if: success() || failure()
         env:
           BENCH_REPO: ${{ github.workspace }}/benchmarks
         run: >-

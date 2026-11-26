@@ -279,7 +279,7 @@ def profile(args) -> None:
                 run(["sudo", "chown", f"{os.getuid()}", str(perf_data)])
                 script = outdir / f"{label}.perf.txt"
                 with script.open("w") as handle:
-                    run(["perf", "script", "-i", str(perf_data), "--symfs", str(symfs), "-F", "comm,tid,ip,sym,dso"],
+                    run(["perf", "script", "-i", str(perf_data), "--symfs", str(symfs)],
                         stdout=handle, stderr=subprocess.PIPE)
                 folded = outdir / f"{label}.folded"
                 with script.open() as source, folded.open("w") as handle:
