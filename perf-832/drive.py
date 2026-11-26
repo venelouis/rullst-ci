@@ -112,11 +112,12 @@ class Ctx:
         time.sleep(self.config["warmup"].get("settle_s", 2) + 1)
         return server
 
-    def load(self, server: containers.Server, path: str, connections: int, seconds: int, statuses: bool = False) -> dict:
+    def load(self, server: containers.Server, path: str, connections: int, seconds: int, statuses: bool = False,
+             headers: dict | None = None) -> dict:
         metrics = loadgen.run_load(
             self.wrk, server.base_url, connections=connections, duration_s=seconds, config=self.config,
             client_cpus=self.split["client"], server=server, database=self.db_handle,
-            db_cpus=self.split["database"], workload=W.static(path), count_statuses=statuses)
+            db_cpus=self.split["database"], workload=W.static(path, headers=headers), count_statuses=statuses)
         metrics.pop("_ram_samples", None)
         return metrics
 
@@ -159,10 +160,11 @@ def throughput(args) -> None:
                 log(f"round {number + 1}/{args.rounds}: {variant} {args.path}")
                 server = ctx.start(variant)
                 try:
-                    warm = ctx.load(server, args.path, 125, args.warmup, statuses=True)
+                    headers = {"Cookie": args.cookie} if args.cookie else None
+                    warm = ctx.load(server, args.path, 125, args.warmup, statuses=True, headers=headers)
                     time.sleep(2)
                     before = containers.rows_updated(ctx.config) if "updates" in args.path else None
-                    measured = ctx.load(server, args.path, 125, args.seconds)
+                    measured = ctx.load(server, args.path, 125, args.seconds, headers=headers)
                     record = {"variant": variant, "round": number + 1, "warmup_errors": warm["non_2xx"]
                               + warm["transport_errors"], **keep(measured)}
                     if before is not None:
@@ -391,6 +393,7 @@ def main() -> int:
     t.add_argument("--rounds", type=int, default=5)
     t.add_argument("--warmup", type=int, default=5)
     t.add_argument("--seconds", type=int, default=10)
+    t.add_argument("--cookie", default="", help="Cookie header every request sends")
     t.add_argument("--out", required=True)
     s = sub.add_parser("sql")
     s.add_argument("--variants", required=True)

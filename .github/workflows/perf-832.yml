@@ -67,7 +67,7 @@ jobs:
 
   layers:
     needs: [plan, build]
-    if: ${{ !contains(github.event.head_commit.message, '[only-profile]') && !contains(github.event.head_commit.message, '[only-updates]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-layers]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
@@ -108,7 +108,7 @@ jobs:
 
   fortunes:
     needs: [plan, build]
-    if: ${{ !contains(github.event.head_commit.message, '[only-profile]') && !contains(github.event.head_commit.message, '[only-updates]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-fortunes]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -144,7 +144,7 @@ jobs:
 
   updates:
     needs: [plan, build]
-    if: ${{ !contains(github.event.head_commit.message, '[only-profile]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-updates]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -184,9 +184,58 @@ jobs:
           name: updates
           path: out/
 
+  extras:
+    needs: [plan, build]
+    if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-extras]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Rullst/Benchmarks
+          ref: ${{ needs.plan.outputs.bench_sha }}
+          path: benchmarks
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-*
+          path: images
+          merge-multiple: true
+      - name: Setup
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+        run: perf-832/setup.sh
+      - name: Hello world with a CSRF cookie on every request
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py throughput --path /text --rounds 5
+          --cookie rullst_csrf=AbCdEfGhIjKlMnOpQrStUvWxYz012345
+          --variants axum,minimal,rullst,no-csrf --out out/cookie-text.json
+      - name: /fortunes with and without the tracing subscriber
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py throughput --path /fortunes --rounds 5
+          --variants axum,minimal,rullst,patched-full,full-nolog --out out/fortunes-nolog.json
+      - name: /updates with and without the tracing subscriber
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py throughput --path "/updates?queries=20" --rounds 5
+          --variants axum,minimal,rullst,patched-full,full-nolog --out out/updates-nolog.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: extras
+          path: out/
+
   profile:
     needs: [plan, build]
-    if: ${{ !contains(github.event.head_commit.message, '[only-updates]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-profile]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -226,7 +275,7 @@ jobs:
       - name: Binaries and symbols from the profiling images
         run: |
           set -eu
-          for image in axum-p rullst-p rullst-minimal-p; do
+          for image in axum-p rullst-p rullst-minimal-p rullst-ablate; do
             cid="$(docker create "bench/$image:local")"
             mkdir -p "symfs/$image/app" bin
             docker cp "$cid:/app/server" "symfs/$image/app/server"
@@ -248,9 +297,10 @@ jobs:
         if: success() || failure()
         env:
           BENCH_REPO: ${{ github.workspace }}/benchmarks
+          ALLOC_TARGETS: rullst-p=/text,minimal-p=/text,axum-p=/text,rullst-p=/fortunes,minimal-p=/fortunes,axum-p=/fortunes,patched-full=/text,bare=/text,add-vary=/text,add-csrf=/text,add-waf=/text,add-cookies=/text,add-headers=/text,add-install=/text,no-install=/text
         run: >-
           python3 perf-832/drive.py alloc --bin bin --oha "$OHA" --out out/alloc
-          --targets "rullst-p=/text,minimal-p=/text,axum-p=/text,rullst-p=/fortunes,minimal-p=/fortunes,axum-p=/fortunes"
+          --targets "${ALLOC_TARGETS}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
