@@ -67,7 +67,7 @@ jobs:
 
   layers:
     needs: [plan, build]
-    if: ${{ !contains(github.event.head_commit.message, '[only-profile]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[only-profile]') && !contains(github.event.head_commit.message, '[only-updates]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
@@ -108,7 +108,7 @@ jobs:
 
   fortunes:
     needs: [plan, build]
-    if: ${{ !contains(github.event.head_commit.message, '[only-profile]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[only-profile]') && !contains(github.event.head_commit.message, '[only-updates]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -186,6 +186,7 @@ jobs:
 
   profile:
     needs: [plan, build]
+    if: ${{ !contains(github.event.head_commit.message, '[only-updates]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:

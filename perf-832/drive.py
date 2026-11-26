@@ -193,8 +193,9 @@ XACTS = ("SELECT pg_stat_statements_reset(); SELECT xact_commit + xact_rollback 
          "WHERE datname = current_database()")
 
 
-def xacts(config: dict) -> int:
-    return int(containers.psql(config, XACTS).splitlines()[-1])
+def xacts(config: dict, reset: bool = True) -> int:
+    sql_text = XACTS if reset else XACTS.split("; ", 1)[1]
+    return int(containers.psql(config, sql_text).splitlines()[-1])
 
 
 def db_log_lines() -> list[str]:
@@ -225,7 +226,7 @@ def sql(args) -> None:
                     marker = len(db_log_lines())
                     status = http_get(server.port, path)
                     time.sleep(13)
-                    r2 = xacts(config)
+                    r2 = xacts(config, reset=False)
                     request_lines = db_log_lines()[marker:]
                     statements = containers.psql(
                         config, "SELECT json_agg(json_build_object('calls', calls, 'rows', rows, 'query', query) "
