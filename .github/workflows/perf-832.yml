@@ -1,0 +1,251 @@
+name: perf-832 phase 1
+
+# Rullst issue #832, phase 1 of the 13.1 performance work: find the causes of the gaps the Benchmarks measured.
+# Scratch workflow in the maintainer's fork; nothing here is published and no fix is made.
+# Rullst under test: the published crates.io release 13.0.0-rc.1 (the Benchmarks Dockerfiles take it through
+# the RULLST_VERSION build argument); the one patched build (rullst-ablate) patches the published rullst-core
+# 13.0.0-rc.1 source, verified by SHA-256 (perf-832/build.sh).
+
+on:
+  push:
+    branches: [scratch/perf-832-phase1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RULLST_VERSION: 13.0.0-rc.1
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      bench_sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - id: sha
+        run: |
+          sha="$(git ls-remote https://github.com/Rullst/Benchmarks.git refs/heads/main | cut -f1)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Rullst/Benchmarks main = $sha" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [axum, rullst, rullst-minimal, rullst-ablate, axum-p, rullst-p, rullst-minimal-p]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Rullst/Benchmarks
+          ref: ${{ needs.plan.outputs.bench_sha }}
+          path: benchmarks
+          persist-credentials: false
+      - id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: out-images
+          key: img-v1-${{ matrix.name }}-${{ needs.plan.outputs.bench_sha }}-${{ hashFiles('perf-832/build.sh', 'perf-832/ablate.patch') }}
+      - name: Build ${{ matrix.name }}
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+          OUT: ${{ github.workspace }}/out-images
+        run: perf-832/build.sh "${{ matrix.name }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ matrix.name }}
+          path: out-images/
+          retention-days: 7
+
+  layers:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Rullst/Benchmarks
+          ref: ${{ needs.plan.outputs.bench_sha }}
+          path: benchmarks
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-*
+          path: images
+          merge-multiple: true
+      - name: Setup
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+        run: perf-832/setup.sh
+      - name: Hello world, the generated stack one layer at a time
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py throughput --path /text --rounds 5
+          --variants axum,minimal,rullst,patched-full,bare,add-vary,add-csrf,add-waf,add-cookies,add-headers,add-install,no-vary,no-csrf,no-waf,no-cookies,no-headers,no-install,no-connectinfo,bare-nolog,full-nolog
+          --out out/layers-${{ matrix.runner }}.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: layers-${{ matrix.runner }}
+          path: out/
+
+  fortunes:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Rullst/Benchmarks
+          ref: ${{ needs.plan.outputs.bench_sha }}
+          path: benchmarks
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-*
+          path: images
+          merge-multiple: true
+      - name: Setup
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+        run: perf-832/setup.sh
+      - name: /fortunes throughput and p99
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py throughput --path /fortunes --rounds 5
+          --variants axum,minimal,rullst --out out/fortunes.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: fortunes
+          path: out/
+
+  updates:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Rullst/Benchmarks
+          ref: ${{ needs.plan.outputs.bench_sha }}
+          path: benchmarks
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-*
+          path: images
+          merge-multiple: true
+      - name: Setup
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+        run: perf-832/setup.sh
+      - name: Statements and transactions per request
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py sql --variants axum,rullst,minimal
+          --paths "/updates?queries=1,/updates?queries=20,/queries?queries=20,/fortunes" --out out/sql.json
+      - name: /updates throughput and p99
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py throughput --path "/updates?queries=20" --rounds 5
+          --variants axum,minimal,rullst --out out/updates.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: updates
+          path: out/
+
+  profile:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Rullst/Benchmarks
+          ref: ${{ needs.plan.outputs.bench_sha }}
+          path: benchmarks
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-*
+          path: images
+          merge-multiple: true
+      - name: Profiling tools
+        run: |
+          set -x
+          sudo apt-get update -qq
+          sudo apt-get install -y heaptrack linux-tools-common "linux-tools-$(uname -r)" \
+            || sudo apt-get install -y heaptrack linux-tools-common linux-tools-azure \
+            || sudo apt-get install -y heaptrack linux-tools-generic
+          perf_bin="$(ls /usr/lib/linux-tools/*/perf | head -1)"
+          sudo ln -sf "$perf_bin" /usr/local/bin/perf
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          perf --version
+          apt-cache policy heaptrack | head -3
+          cargo install inferno --version 0.12.8 --locked
+          inferno-flamegraph --version
+          heaptrack_print --help | head -40
+      - name: Setup
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+        run: perf-832/setup.sh oha
+      - name: Binaries and symbols from the profiling images
+        run: |
+          set -eu
+          for image in axum-p rullst-p rullst-minimal-p; do
+            cid="$(docker create "bench/$image:local")"
+            mkdir -p "symfs/$image/app" bin
+            docker cp "$cid:/app/server" "symfs/$image/app/server"
+            cp "symfs/$image/app/server" "bin/$image"
+            docker rm "$cid" > /dev/null
+          done
+          ls -la bin
+          "$OHA" --version
+      - name: CPU profiles (perf, frame pointers)
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py profile --symfs symfs --out out/profile
+          --targets "rullst-p=/text,minimal-p=/text,rullst-p=/fortunes,minimal-p=/fortunes,axum-p=/fortunes,rullst-p=/updates?queries=20,axum-p=/updates?queries=20"
+      - name: Allocation profiles (heaptrack)
+        if: always()
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py alloc --bin bin --oha "$OHA" --out out/alloc
+          --targets "rullst-p=/text,minimal-p=/text,axum-p=/text,rullst-p=/fortunes,minimal-p=/fortunes,axum-p=/fortunes"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: profile
+          path: out/
