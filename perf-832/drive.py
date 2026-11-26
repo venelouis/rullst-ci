@@ -277,7 +277,6 @@ def profile(args) -> None:
                      "-o", str(perf_data), "--", "sleep", str(args.seconds)], stderr=subprocess.PIPE)
                 thread.join()
                 symfs = (Path(args.symfs) / VARIANTS[variant][0]).resolve()
-                run(["sudo", "chown", f"{os.getuid()}", str(perf_data)])
                 script = outdir / f"{label}.perf.txt"
                 status = "ok"
                 try:
@@ -348,16 +347,18 @@ def alloc(args) -> None:
                        "DB_POOL_SIZE": str(ctx.config["server"]["pool_size"]), "BENCH_WORKERS": "2",
                        **{k: str(v) for k, v in manifest.get("env", {}).items()}}
                 prefix = outdir / label
-                proc = subprocess.Popen(["taskset", "-c", server_cpus, "heaptrack", "-o", str(prefix), str(binary)],
+                proc = subprocess.Popen(["taskset", "-c", server_cpus, "heaptrack", "-o", str(prefix), str(binary.resolve())],
                                         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 try:
                     wait_http(port)
                     oha(ctx, Path(args.oha), port, path, args.warm)
                     result = oha(ctx, Path(args.oha), port, path, count)
                 finally:
-                    proc.send_signal(signal.SIGTERM)
+                    # Signal the server itself, not the heaptrack wrapper: the wrapper must stay to finish
+                    # reading the trace from the pipe.
+                    subprocess.run(["pkill", "-TERM", "-f", f"^{binary.resolve()}$"], check=False)
                     try:
-                        proc.wait(timeout=60)
+                        proc.wait(timeout=180)
                     except subprocess.TimeoutExpired:
                         proc.kill()
                     time.sleep(3)
