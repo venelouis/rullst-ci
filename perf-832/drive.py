@@ -21,6 +21,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -278,19 +279,26 @@ def profile(args) -> None:
                 symfs = (Path(args.symfs) / VARIANTS[variant][0]).resolve()
                 run(["sudo", "chown", f"{os.getuid()}", str(perf_data)])
                 script = outdir / f"{label}.perf.txt"
-                with script.open("w") as handle:
-                    run(["perf", "script", "-i", str(perf_data), "--symfs", str(symfs)],
-                        stdout=handle, stderr=subprocess.PIPE)
-                folded = outdir / f"{label}.folded"
-                with script.open() as source, folded.open("w") as handle:
-                    run(["inferno-collapse-perf"], stdin=source, stdout=handle, stderr=subprocess.PIPE)
-                with folded.open() as source, (outdir / f"{label}.svg").open("w") as handle:
-                    run(["inferno-flamegraph", "--title", f"{variant} {path} (perf, {args.freq} Hz)"], stdin=source,
-                        stdout=handle, stderr=subprocess.PIPE)
+                status = "ok"
+                try:
+                    with script.open("w") as handle:
+                        run(["sudo", "perf", "script", "--no-inline", "-i", str(perf_data), "--symfs", str(symfs)],
+                            stdout=handle, stderr=subprocess.PIPE)
+                    folded = outdir / f"{label}.folded"
+                    with script.open() as source, folded.open("w") as handle:
+                        run(["inferno-collapse-perf"], stdin=source, stdout=handle, stderr=subprocess.PIPE)
+                    with folded.open() as source, (outdir / f"{label}.svg").open("w") as handle:
+                        run(["inferno-flamegraph", "--title", f"{variant} {path} (perf, {args.freq} Hz)"],
+                            stdin=source, stdout=handle, stderr=subprocess.PIPE)
+                except subprocess.CalledProcessError as error:
+                    status = f"failed: {error} {error.stderr}"
+                    log(status)
+                if status != "ok":
+                    shutil.copy(perf_data, outdir / f"{label}.failed.perf.data")
                 perf_data.unlink()
-                script.unlink()
+                script.unlink(missing_ok=True)
                 meta["profiles"].append({"label": label, "variant": variant, "path": path,
-                                         "load_during_profile": keep(holder.get("m", {}))})
+                                         "status": status, "load_during_profile": keep(holder.get("m", {}))})
             finally:
                 server.stop()
             write(outdir / "profile-meta.json", meta)
@@ -312,7 +320,7 @@ def wait_http(port: int, seconds: float = 60) -> None:
 
 def oha(ctx: Ctx, binary: Path, port: int, path: str, count: int, connections: int = 8) -> dict:
     cmd = ["taskset", "-c", system.format_cpu_list(ctx.split["client"]), str(binary), "-n", str(count),
-           "-c", str(connections), "--no-tui", "-j", f"http://127.0.0.1:{port}{path}"]
+           "-c", str(connections), "--no-tui", "--output-format", "json", f"http://127.0.0.1:{port}{path}"]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     data = json.loads(result.stdout)
     return {"summary": data.get("summary"), "status_codes": data.get("statusCodeDistribution"),
