@@ -1,0 +1,214 @@
+diff --git a/rullst-orm-macros/src/models/dirty_tracking.rs b/rullst-orm-macros/src/models/dirty_tracking.rs
+index ca79df383..a903395e4 100644
+--- a/rullst-orm-macros/src/models/dirty_tracking.rs
++++ b/rullst-orm-macros/src/models/dirty_tracking.rs
+@@ -180,7 +180,8 @@ pub(crate) struct TrackedUpdate<'a> {
+ 
+ /// The update branch of a tracked `save_with_tx_internal`: it returns
+ /// `Ok(false)` when nothing changed, otherwise writes the changed columns and
+-/// reloads the others from the stored row. Expects `observers` and `conn`.
++/// reloads the others, and the database-managed ones, from the stored row.
++/// Expects `observers` and `conn`.
+ pub(crate) fn tracked_update(parsed: &ParsedModel, update: &TrackedUpdate<'_>) -> TokenStream {
+     let Some(snapshot) = parsed.snapshot_field.as_ref() else {
+         return quote! {};
+@@ -215,6 +216,77 @@ pub(crate) fn tracked_update(parsed: &ParsedModel, update: &TrackedUpdate<'_>) -
+         }
+     };
+     let managed = database_managed_columns(parsed);
++    let execute_update = quote! {
++        if let Some(t) = timeout {
++            rullst_orm::_tokio::time::timeout(t, query.execute(&mut *conn))
++                .await
++                .map_err(|_| rullst_orm::Error::DatabaseError("Query execution timed out".to_string()))??
++        } else {
++            query.execute(&mut *conn).await?
++        }
++    };
++    let read_back = quote! {
++        let stored: Option<Self> = if returning {
++            let row = if let Some(t) = timeout {
++                rullst_orm::_tokio::time::timeout(t, query.fetch_optional(&mut *conn))
++                    .await
++                    .map_err(|_| rullst_orm::Error::DatabaseError("Query execution timed out".to_string()))??
++            } else {
++                query.fetch_optional(&mut *conn).await?
++            };
++            match row {
++                Some(row) => Some(rullst_orm::_sqlx::FromRow::from_row(&row)?),
++                None => None,
++            }
++        } else {
++            let update_result = #execute_update;
++            #rows_check
++            let lookup = rullst_orm::_sqlx::query_as::<_, Self>(
++                rullst_orm::_sqlx::AssertSqlSafe(#lookup_sql)
++            ).bind(self.id) #tenant_binding;
++            if let Some(t) = timeout {
++                rullst_orm::_tokio::time::timeout(t, lookup.fetch_optional(&mut *conn))
++                    .await
++                    .map_err(|_| rullst_orm::Error::DatabaseError("Query execution timed out".to_string()))??
++            } else {
++                lookup.fetch_optional(&mut *conn).await?
++            }
++        };
++        let Some(mut stored) = stored else {
++            #missing_row
++        };
++        stored.__rullst_decrypt_encrypted_fields()?;
++        // Columns this save did not write take their stored values, which
++        // another writer may have changed since this handle was read.
++        #(
++            if !written[#indexes] {
++                ::core::mem::swap(&mut self.#columns, &mut stored.#columns);
++            }
++        )*
++        #(
++            ::core::mem::swap(&mut self.#managed, &mut stored.#managed);
++        )*
++    };
++    // The stored row is read back for the columns this UPDATE leaves
++    // unwritten and the database-managed ones: PostgreSQL and SQLite return
++    // it, MySQL/MariaDB re-read it under the row lock this UPDATE holds. A
++    // model without database-managed columns whose UPDATE writes every
++    // tracked column has nothing to read back.
++    let (refresh, write) = if managed.is_empty() {
++        (
++            quote! { let refresh = written.contains(&false); },
++            quote! {
++                if refresh {
++                    #read_back
++                } else {
++                    let update_result = #execute_update;
++                    #rows_check
++                }
++            },
++        )
++    } else {
++        (quote! { let refresh = true; }, read_back)
++    };
+     quote! {
+         let mut fingerprints = self.__rullst_fingerprints();
+         if !self.#snapshot.__any_changed(&fingerprints) {
+@@ -239,9 +311,8 @@ pub(crate) fn tracked_update(parsed: &ParsedModel, update: &TrackedUpdate<'_>) -
+             return Ok(false);
+         }
+         let driver = rullst_orm::Orm::driver()?;
+-        // PostgreSQL and SQLite return the stored row; MySQL/MariaDB re-read it
+-        // under the row lock this UPDATE holds.
+-        let returning = driver != "mysql";
++        #refresh
++        let returning = refresh && driver != "mysql";
+         let mut final_sql = format!(
+             "UPDATE {} SET {} WHERE id = ?{}",
+             #table_name,
+@@ -265,52 +336,7 @@ pub(crate) fn tracked_update(parsed: &ParsedModel, update: &TrackedUpdate<'_>) -
+         )*
+         let query = query.bind(self.id) #tenant_binding;
+         let timeout = rullst_orm::schema::get_query_timeout();
+-        let stored: Option<Self> = if returning {
+-            let row = if let Some(t) = timeout {
+-                rullst_orm::_tokio::time::timeout(t, query.fetch_optional(&mut *conn))
+-                    .await
+-                    .map_err(|_| rullst_orm::Error::DatabaseError("Query execution timed out".to_string()))??
+-            } else {
+-                query.fetch_optional(&mut *conn).await?
+-            };
+-            match row {
+-                Some(row) => Some(rullst_orm::_sqlx::FromRow::from_row(&row)?),
+-                None => None,
+-            }
+-        } else {
+-            let update_result = if let Some(t) = timeout {
+-                rullst_orm::_tokio::time::timeout(t, query.execute(&mut *conn))
+-                    .await
+-                    .map_err(|_| rullst_orm::Error::DatabaseError("Query execution timed out".to_string()))??
+-            } else {
+-                query.execute(&mut *conn).await?
+-            };
+-            #rows_check
+-            let lookup = rullst_orm::_sqlx::query_as::<_, Self>(
+-                rullst_orm::_sqlx::AssertSqlSafe(#lookup_sql)
+-            ).bind(self.id) #tenant_binding;
+-            if let Some(t) = timeout {
+-                rullst_orm::_tokio::time::timeout(t, lookup.fetch_optional(&mut *conn))
+-                    .await
+-                    .map_err(|_| rullst_orm::Error::DatabaseError("Query execution timed out".to_string()))??
+-            } else {
+-                lookup.fetch_optional(&mut *conn).await?
+-            }
+-        };
+-        let Some(mut stored) = stored else {
+-            #missing_row
+-        };
+-        stored.__rullst_decrypt_encrypted_fields()?;
+-        // Columns this save did not write take their stored values, which
+-        // another writer may have changed since this handle was read.
+-        #(
+-            if !written[#indexes] {
+-                ::core::mem::swap(&mut self.#columns, &mut stored.#columns);
+-            }
+-        )*
+-        #(
+-            ::core::mem::swap(&mut self.#managed, &mut stored.#managed);
+-        )*
++        #write
+         self.__rullst_capture_snapshot();
+     }
+ }
+diff --git a/rullst-orm-macros/src/models/dirty_tracking_tests.rs b/rullst-orm-macros/src/models/dirty_tracking_tests.rs
+index 77c085830..3dd868637 100644
+--- a/rullst-orm-macros/src/models/dirty_tracking_tests.rs
++++ b/rullst-orm-macros/src/models/dirty_tracking_tests.rs
+@@ -170,7 +170,10 @@ fn a_tracked_update_writes_only_changed_columns_and_reloads_the_rest() {
+         update.contains("if written [1usize] { query = query . bind (self . body . clone ()) ; }")
+     );
+     assert!(update.contains("if assignments . is_empty () { return Ok (false) ; }"));
+-    assert!(update.contains("let returning = driver != \"mysql\""));
++    // Database-managed columns are read back after every UPDATE.
++    assert!(update.contains("let refresh = true ;"), "{update}");
++    assert!(!update.contains("written . contains"), "{update}");
++    assert!(update.contains("let returning = refresh && driver != \"mysql\""));
+     assert!(update.contains("final_sql . push_str (\" RETURNING *\")"));
+     assert!(update.contains("\"posts\""));
+     assert!(update.contains("query . bind (self . id) ;"));
+@@ -190,6 +193,39 @@ fn a_tracked_update_writes_only_changed_columns_and_reloads_the_rest() {
+     assert!(update.ends_with("self . __rullst_capture_snapshot () ;"));
+ }
+ 
++/// Without database-managed columns, an UPDATE that writes every tracked
++/// column reads nothing back: no `RETURNING *`, no MySQL/MariaDB `SELECT`.
++#[test]
++fn a_tracked_update_of_every_column_reads_nothing_back() {
++    let parsed = parse(parse_quote! {
++        #[orm(table = "posts")]
++        struct Post { id: i32, title: String, body: String, #[sqlx(skip)] snapshot: RowSnapshot }
++    });
++    let update = update_parts(&parsed, "", quote! {});
++    assert!(
++        update.contains("let refresh = written . contains (& false) ;"),
++        "{update}"
++    );
++    assert!(update.contains("let returning = refresh && driver != \"mysql\""));
++    // The plain branch is the last `else`: the read-back keeps its own
++    // MySQL/MariaDB `execute` branch.
++    let (read_back, plain) = update
++        .rsplit_once("} else { let update_result =")
++        .expect("read-back and plain branches");
++    let read_back = read_back
++        .rsplit_once("if refresh {")
++        .expect("read-back branch")
++        .1;
++    assert!(read_back.contains("\"SELECT * FROM posts WHERE id = ?\""));
++    assert!(read_back.contains("stored . __rullst_decrypt_encrypted_fields () ? ;"));
++    assert!(!plain.contains("stored"), "{plain}");
++    assert!(!plain.contains("fetch_optional"), "{plain}");
++    assert!(plain.starts_with(" if let Some (t) = timeout"), "{plain}");
++    assert!(plain.contains("query . execute (& mut * conn)"));
++    assert!(plain.contains("check_rows () ;"));
++    assert!(update.ends_with("self . __rullst_capture_snapshot () ;"));
++}
++
+ #[test]
+ fn a_tenant_scoped_tracked_update_keeps_the_tenant_predicate() {
+     let parsed = parse(parse_quote! {

@@ -1,0 +1,86 @@
+name: perf-832 phase 2 save
+
+# Rullst issue #832, phase 2 of the 13.1 performance work, direction 7: paired before/after measurements of the
+# save() change (no explicit transaction for a single-statement save, and no read-back after a tracked UPDATE of
+# every column). Scratch workflow in the maintainer's fork; nothing here is published.
+# Before: the Benchmarks frameworks/rullst image on the published crates.io release 13.0.0-rc.1. After: the same
+# image with the published rullst-orm-macros 13.0.0-rc.1 source (SHA-256 checked) patched by
+# perf-832/patches/<save-trim|save>.patch. All images are built and measured in the same job, rotating the order
+# every round. The "-off" variants run the patched images with the ORM query timeout turned off at start-up.
+
+on:
+  push:
+    branches: [scratch/perf-832-save]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RULLST_VERSION: 13.0.0-rc.1
+  BENCH_SHA: 4dfa6b6267cd452d6cc3bd860a4d6a2a8972ccf9
+  VARIANTS: rullst,trim,save,trim-off,save-off
+
+jobs:
+  pair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Rullst/Benchmarks
+          ref: ${{ env.BENCH_SHA }}
+          path: benchmarks
+          persist-credentials: false
+      - name: Host
+        run: |
+          nproc; lscpu | grep -i "model name"; uname -a
+          sha256sum perf-832/patches/*.patch
+      - name: Build the before and after images in this job
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+          OUT: ${{ github.workspace }}/out/images
+        run: |
+          perf-832/build.sh rullst
+          perf-832/build.sh rullst-save-trim
+          perf-832/build.sh rullst-save
+      - name: Setup (wrk)
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+        run: perf-832/setup.sh
+      - name: /updates?queries=20, paired
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py throughput --path '/updates?queries=20' --rounds 5
+          --variants "$VARIANTS" --out out/updates.json
+      - name: /queries?queries=20, paired
+        if: success() || failure()
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py throughput --path '/queries?queries=20' --rounds 5
+          --variants "$VARIANTS" --out out/queries.json
+      - name: Statements of one request (PostgreSQL log, pg_stat_statements)
+        if: success() || failure()
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py sql --variants "$VARIANTS"
+          --paths '/updates?queries=20,/queries?queries=20' --out out/sql.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: save-${{ matrix.runner }}
+          path: |
+            out/*.json
+            out/images/*.txt
+            out/images/*.sha256
+          retention-days: 30
