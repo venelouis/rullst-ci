@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 1 of Rullst issue #832 (13.1 performance work): measurements that reuse the Benchmarks harness.
+"""Rullst issue #832 (13.1 performance work), phases 1 and 2: measurements that reuse the Benchmarks harness.
 
 Servers are the Benchmarks images (bench/<slug>:local, built by perf-832/build.sh), started with the harness's
 containers.start_server on the harness's CPU split, loaded with the harness's wrk (loadgen.run_load, 125
@@ -71,6 +71,10 @@ VARIANTS: dict[str, tuple[str, str, dict]] = {
     "add-install": ("rullst-ablate", "rullst", {"RULLST_ABLATE": additive(6)}),
     "bare-nolog": ("rullst-ablate", "rullst", {"RULLST_ABLATE": skip(), "RUST_LOG": "off"}),
     "full-nolog": ("rullst-ablate", "rullst", {"RUST_LOG": "off"}),
+    # Phase 2, html! (direction 5): frameworks/rullst with rullst-macros (html1) or rullst-macros and rullst-core
+    # (html2) 13.0.0-rc.1 patched by perf-832/patches/ (perf-832/build.sh).
+    "html1": ("rullst-html1", "rullst", {}),
+    "html2": ("rullst-html2", "rullst", {}),
 }
 for part in ALL:
     VARIANTS[f"no-{part}"] = ("rullst-ablate", "rullst", {"RULLST_ABLATE": part})

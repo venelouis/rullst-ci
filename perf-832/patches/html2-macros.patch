@@ -1,0 +1,961 @@
+diff --git a/rullst-macros/src/html_attributes.rs b/rullst-macros/src/html_attributes.rs
+index 1fc5de4ad..be9971697 100644
+--- a/rullst-macros/src/html_attributes.rs
++++ b/rullst-macros/src/html_attributes.rs
+@@ -11,6 +11,8 @@ use syn::parse::{Parse, ParseStream};
+ use syn::spanned::Spanned;
+ use syn::{Expr, Ident, LitStr, Result, Token, token};
+ 
++use super::write::{Helpers, Writer};
++
+ pub struct HtmlAttribute {
+     pub name: String,
+     pub value: HtmlAttrValue,
+@@ -66,10 +68,10 @@ pub fn allows_data_urls(tag: &str) -> bool {
+         .any(|element| tag.eq_ignore_ascii_case(element))
+ }
+ 
+-/// Local helper emitted into elements with dynamic URL attributes. It returns
+-/// the escaped value, or `#` for a script-capable scheme. It is generated
+-/// inline instead of calling a runtime function, so the expansion works with
+-/// any `rullst::html` version that provides `escape_attr`.
++/// Local helper emitted once into an expansion with dynamic URL attributes.
++/// The escaped value has just been written to `buffer` from `start`; a
++/// script-capable scheme replaces it with `#`. It is generated inline instead
++/// of calling a runtime function.
+ ///
+ /// Like the URL parser, it skips leading C0 controls and spaces and ignores
+ /// ASCII tab, LF and CR anywhere before reading the scheme. Every character
+@@ -79,18 +81,23 @@ pub fn allows_data_urls(tag: &str) -> bool {
+ pub fn url_guard_tokens() -> TokenStream {
+     quote! {
+         #[inline]
+-        fn rullst_url_attr(value: &str, allow_data: bool) -> &str {
++        fn rullst_url_attr(buffer: &mut String, start: usize, allow_data: bool) {
+             let mut scheme = [0u8; 10];
+             let mut len = 0usize;
++            let value = buffer.get(start..).unwrap_or_default();
+             for byte in value.bytes().skip_while(|byte| *byte <= b' ') {
+                 match byte {
+                     b'\t' | b'\n' | b'\r' => {}
+                     b':' => {
+                         let scheme = &scheme[..len];
+-                        let unsafe_scheme = scheme == b"javascript"
++                        if scheme == b"javascript"
+                             || scheme == b"vbscript"
+-                            || (!allow_data && scheme == b"data");
+-                        return if unsafe_scheme { "#" } else { value };
++                            || (!allow_data && scheme == b"data")
++                        {
++                            buffer.truncate(start);
++                            buffer.push('#');
++                        }
++                        return;
+                     }
+                     b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'+' | b'-' | b'.'
+                         if len < scheme.len() =>
+@@ -98,10 +105,9 @@ pub fn url_guard_tokens() -> TokenStream {
+                         scheme[len] = byte.to_ascii_lowercase();
+                         len += 1;
+                     }
+-                    _ => return value,
++                    _ => return,
+                 }
+             }
+-            value
+         }
+     }
+ }
+@@ -114,13 +120,12 @@ fn static_attribute_value(lit: &LitStr) -> String {
+     lit.value().replace('"', "&quot;")
+ }
+ 
+-/// Items emitted once into an element with `name={value}` attributes. Each
++/// Items emitted once into an expansion with `name={value}` attributes. Each
+ /// such value is passed to `rullst_attribute_value`, which resolves by
+ /// autoref to the deprecated method for an `Option` (or `&Option`) and to the
+ /// plain one for every other type, so `name={option}` raises a deprecation
+ /// warning at the value while the attribute is written exactly as before. The
+-/// calls do nothing at run time. Generated inline, like the URL guard, so the
+-/// expansion needs nothing new from `rullst::html`.
++/// calls do nothing at run time. Generated inline, like the URL guard.
+ pub fn option_value_probe_tokens() -> TokenStream {
+     quote! {
+         struct RullstAttributeValue<'a, T: ?Sized>(&'a T);
+@@ -284,12 +289,6 @@ impl Parse for HtmlAttribute {
+ }
+ 
+ impl HtmlAttribute {
+-    /// Whether the attribute is written `name={value}`, whose element needs
+-    /// [`option_value_probe_tokens`].
+-    pub fn is_dynamic(&self) -> bool {
+-        matches!(self.value, HtmlAttrValue::Dynamic(_))
+-    }
+-
+     /// Bytes this attribute writes at least, for the buffer capacity.
+     pub fn static_size(&self) -> usize {
+         match &self.value {
+@@ -299,60 +298,75 @@ impl HtmlAttribute {
+         }
+     }
+ 
+-    /// Statements appending the attribute to `buffer`, and whether they call
+-    /// the element's local URL guard.
+-    pub fn to_tokens(&self, buffer: &Ident, allow_data_urls: bool) -> (TokenStream, bool) {
++    /// Whether the value's expression mentions `continue` or `break`.
++    pub(super) fn mentions_loop_exit(&self) -> bool {
++        match &self.value {
++            HtmlAttrValue::Dynamic(expr) | HtmlAttrValue::Optional(expr) => {
++                super::write::expr_mentions_loop_exit(expr)
++            }
++            HtmlAttrValue::Static(_) | HtmlAttrValue::Bare => false,
++        }
++    }
++
++    /// Appends the statements that write the attribute, and records the
++    /// local helpers they call.
++    pub(super) fn write(&self, out: &mut Writer, helpers: &mut Helpers, allow_data_urls: bool) {
+         let name = &self.name;
+-        let prefix = format!(" {name}=\"");
++        let buffer = out.buffer().clone();
+         let is_url = is_url_attribute(name);
+-        // The escaped value of a URL attribute goes through the guard.
+-        let write_value = |value: TokenStream| {
++        // The escaped value of a URL attribute, written from `start`, goes
++        // through the guard.
++        let start = Ident::new("start", Span::mixed_site());
++        let write_value = |write: TokenStream| {
+             if is_url {
+-                quote! { #buffer.push_str(rullst_url_attr(&#value, #allow_data_urls)); }
++                quote! {
++                    let #start = #buffer.len();
++                    #write
++                    rullst_url_attr(&mut #buffer, #start, #allow_data_urls);
++                }
+             } else {
+-                quote! { #buffer.push_str(&#value); }
++                write
+             }
+         };
+         match &self.value {
+             HtmlAttrValue::Static(lit) => {
+-                let attribute = format!(" {name}=\"{}\"", static_attribute_value(lit));
+-                (quote! { #buffer.push_str(#attribute); }, false)
+-            }
+-            HtmlAttrValue::Bare => {
+-                let attribute = format!(" {name}");
+-                (quote! { #buffer.push_str(#attribute); }, false)
++                out.text(&format!(" {name}=\"{}\"", static_attribute_value(lit)));
+             }
++            HtmlAttrValue::Bare => out.text(&format!(" {name}")),
+             HtmlAttrValue::Dynamic(expr) => {
++                helpers.option_probe = true;
++                helpers.url_guard |= is_url;
+                 let binding = Ident::new("value", Span::mixed_site());
+-                let value = write_value(quote! { rullst::html::escape_attr(#binding) });
++                let value = write_value(super::write::escaped_attribute(&buffer, &binding));
+                 // Spanned at the value, so the `Option` warning points there.
+                 let probe = quote_spanned! { expr.span()=>
+                     (&RullstAttributeValue(#binding)).rullst_attribute_value();
+                 };
+                 // The scrutinee's temporaries, such as `format!(..)`, live
+                 // until the value has been written.
+-                let tokens = quote! {
++                out.text(&format!(" {name}=\""));
++                out.code(quote! {
+                     match &(#expr) {
+                         #binding => {
+                             #probe
+-                            #buffer.push_str(#prefix);
+                             #value
+-                            #buffer.push_str("\"");
+                         }
+                     }
+-                };
+-                (tokens, is_url)
++                });
++                out.text("\"");
+             }
+             HtmlAttrValue::Optional(expr) => {
++                helpers.url_guard |= is_url;
++                let prefix = format!(" {name}=\"");
+                 let bare = format!(" {name}");
+                 let binding = Ident::new("value", Span::mixed_site());
+-                let value = write_value(quote! { #binding });
++                let value = write_value(quote! { #buffer.push_str(&#binding); });
+                 // A value that is neither a `bool` nor an `Option` is reported
+                 // at the expression rather than at the whole macro.
+                 let presence =
+                     quote_spanned! { expr.span()=> rullst::html::optional_attr(&(#expr)) };
+                 // The scrutinee's temporaries live until the match ends.
+-                let tokens = quote! {
++                out.code(quote! {
+                     match #presence {
+                         rullst::html::AttributePresence::Value(#binding) => {
+                             #buffer.push_str(#prefix);
+@@ -362,8 +376,7 @@ impl HtmlAttribute {
+                         rullst::html::AttributePresence::Bare => #buffer.push_str(#bare),
+                         rullst::html::AttributePresence::Absent => {}
+                     }
+-                };
+-                (tokens, is_url)
++                });
+             }
+         }
+     }
+diff --git a/rullst-macros/src/html_control.rs b/rullst-macros/src/html_control.rs
+index 27546bc4e..e568358fc 100644
+--- a/rullst-macros/src/html_control.rs
++++ b/rullst-macros/src/html_control.rs
+@@ -5,11 +5,12 @@
+ //! like Rust's own `if`/`for`/`match` (`if let` included); bodies are `html!`
+ //! nodes in braces.
+ 
+-use proc_macro2::{Span, TokenStream};
++use proc_macro2::TokenStream;
+ use quote::quote;
+ use syn::parse::ParseStream;
+-use syn::{Expr, Ident, Pat, Result, Token, token};
++use syn::{Expr, Pat, Result, Token, token};
+ 
++use super::write::{Helpers, Writer, expr_mentions_loop_exit, write_loop_body};
+ use super::{HtmlNode, parse_children};
+ 
+ pub struct HtmlIf {
+@@ -150,74 +151,83 @@ fn parse_body(input: ParseStream) -> Result<Vec<HtmlNode>> {
+     Ok(nodes)
+ }
+ 
+-/// Statements appending each node of `body` to `buffer`.
+-fn push_nodes(buffer: &Ident, body: &[HtmlNode]) -> TokenStream {
+-    let nodes = body.iter().map(HtmlNode::to_tokens);
+-    quote! { #( #buffer.push_str(&#nodes); )* }
++/// The statements writing the nodes of a block body into `out`'s buffer.
++fn write_body(body: &[HtmlNode], out: &Writer, helpers: &mut Helpers) -> TokenStream {
++    let mut writer = out.body();
++    for node in body {
++        node.write(&mut writer, helpers);
++    }
++    writer.finish()
++}
++
++fn any_mentions_loop_exit(body: &[HtmlNode]) -> bool {
++    body.iter().any(HtmlNode::mentions_loop_exit)
+ }
+ 
+ impl HtmlIf {
+-    /// A block evaluating to the `String` of the branch that matched.
+-    pub fn to_tokens(&self) -> TokenStream {
+-        let buffer = Ident::new("s", Span::mixed_site());
++    /// Appends the `if` chain writing the branch that matched.
++    pub(super) fn write(&self, out: &mut Writer, helpers: &mut Helpers) {
+         let mut chain = TokenStream::new();
+         for (index, (condition, body)) in self.branches.iter().enumerate() {
+-            let pushes = push_nodes(&buffer, body);
++            let writes = write_body(body, out, helpers);
+             if index > 0 {
+                 chain.extend(quote! { else });
+             }
+-            chain.extend(quote! { if #condition { #pushes } });
++            chain.extend(quote! { if #condition { #writes } });
+         }
+         if let Some(body) = &self.otherwise {
+-            let pushes = push_nodes(&buffer, body);
+-            chain.extend(quote! { else { #pushes } });
+-        }
+-        quote! {
+-            {
+-                let mut #buffer = String::new();
+-                #chain
+-                #buffer
+-            }
++            let writes = write_body(body, out, helpers);
++            chain.extend(quote! { else { #writes } });
+         }
++        out.code(chain);
++    }
++
++    pub(super) fn mentions_loop_exit(&self) -> bool {
++        self.branches.iter().any(|(condition, body)| {
++            expr_mentions_loop_exit(condition) || any_mentions_loop_exit(body)
++        }) || self
++            .otherwise
++            .as_deref()
++            .is_some_and(any_mentions_loop_exit)
+     }
+ }
+ 
+ impl HtmlFor {
+-    /// A block evaluating to the `String` of every iteration.
+-    pub fn to_tokens(&self) -> TokenStream {
+-        let buffer = Ident::new("s", Span::mixed_site());
+-        let pushes = push_nodes(&buffer, &self.body);
++    /// Appends the loop writing every iteration.
++    pub(super) fn write(&self, out: &mut Writer, helpers: &mut Helpers) {
++        let mut body = out.body();
++        write_loop_body(&self.body, &mut body, helpers);
++        let writes = body.finish();
+         let pattern = &self.pattern;
+         let iterable = &self.iterable;
+-        quote! {
+-            {
+-                let mut #buffer = String::new();
+-                for #pattern in #iterable { #pushes }
+-                #buffer
+-            }
+-        }
++        out.code(quote! { for #pattern in #iterable { #writes } });
+     }
+ }
+ 
+ impl HtmlMatch {
+-    /// A block evaluating to the `String` of the arm that matched. Rust checks
+-    /// the patterns, guards and exhaustiveness as for its own `match`.
+-    pub fn to_tokens(&self) -> TokenStream {
+-        let buffer = Ident::new("s", Span::mixed_site());
++    /// Appends the `match` writing the arm that matched. Rust checks the
++    /// patterns, guards and exhaustiveness as for its own `match`.
++    pub(super) fn write(&self, out: &mut Writer, helpers: &mut Helpers) {
+         let match_token = &self.match_token;
+         let scrutinee = &self.scrutinee;
+-        let arms = self.arms.iter().map(|arm| {
+-            let pattern = &arm.pattern;
+-            let guard = arm.guard.as_ref().map(|guard| quote! { if #guard });
+-            let pushes = push_nodes(&buffer, &arm.body);
+-            quote! { #pattern #guard => { #pushes } }
+-        });
+-        quote! {
+-            {
+-                let mut #buffer = String::new();
+-                #match_token #scrutinee { #(#arms)* }
+-                #buffer
+-            }
+-        }
++        let arms: Vec<TokenStream> = self
++            .arms
++            .iter()
++            .map(|arm| {
++                let pattern = &arm.pattern;
++                let guard = arm.guard.as_ref().map(|guard| quote! { if #guard });
++                let writes = write_body(&arm.body, out, helpers);
++                quote! { #pattern #guard => { #writes } }
++            })
++            .collect();
++        out.code(quote! { #match_token #scrutinee { #(#arms)* } });
++    }
++
++    pub(super) fn mentions_loop_exit(&self) -> bool {
++        expr_mentions_loop_exit(&self.scrutinee)
++            || self.arms.iter().any(|arm| {
++                arm.guard.as_ref().is_some_and(expr_mentions_loop_exit)
++                    || any_mentions_loop_exit(&arm.body)
++            })
+     }
+ }
+diff --git a/rullst-macros/src/html_parser.rs b/rullst-macros/src/html_parser.rs
+index a108a5b70..1ed8d69b9 100644
+--- a/rullst-macros/src/html_parser.rs
++++ b/rullst-macros/src/html_parser.rs
+@@ -25,7 +25,7 @@ use declarations::{
+ 
+ #[path = "html_attributes.rs"]
+ mod attributes;
+-use attributes::{HtmlAttribute, allows_data_urls, option_value_probe_tokens, url_guard_tokens};
++use attributes::{HtmlAttribute, allows_data_urls};
+ 
+ #[path = "html_control.rs"]
+ mod control;
+@@ -35,6 +35,10 @@ use control::{HtmlFor, HtmlIf, HtmlMatch};
+ mod text;
+ use text::Child;
+ 
++#[path = "html_write.rs"]
++mod write;
++use write::{Helpers, Writer};
++
+ impl Parse for HtmlDocument {
+     fn parse(input: ParseStream) -> Result<Self> {
+         let mut children = Vec::new();
+@@ -156,47 +160,61 @@ fn parse_children(input: ParseStream) -> Result<Vec<HtmlNode>> {
+ }
+ 
+ impl HtmlDocument {
+-    /// Expands the document into a `rullst::html::Markup`: the rendered string
+-    /// already escapes every interpolated value that is not itself markup.
++    /// Expands the document into a `rullst::html::Markup`: every node writes
++    /// into one `String`, escaping every interpolated value that is not
++    /// itself markup.
+     pub fn to_tokens(&self) -> TokenStream {
+-        let rendered = self.render_tokens();
+-        quote! { rullst::html::Markup::from_trusted(#rendered) }
+-    }
+-
+-    fn render_tokens(&self) -> TokenStream {
+-        if self.nodes.len() == 1 {
+-            return self.nodes[0].to_tokens();
+-        }
+-
+         let capacity = self.nodes.iter().map(HtmlNode::static_size).sum::<usize>();
+-        let nodes = self.nodes.iter().map(HtmlNode::to_tokens);
+         // Keep the generated local out of caller expressions, including an `s`
+         // binding in a fragment. Renaming a call-site identifier is not hygiene.
+         let buffer = Ident::new("s", Span::mixed_site());
++        let mut helpers = Helpers::default();
++        let mut out = Writer::new(buffer.clone(), 0);
++        for node in &self.nodes {
++            node.write(&mut out, &mut helpers);
++        }
++        let statements = out.finish();
++        let helpers = helpers.to_tokens();
+         quote! {
+-            {
++            rullst::html::Markup::from_trusted({
++                #helpers
+                 let mut #buffer = String::with_capacity(#capacity);
+-                #(#buffer.push_str(&#nodes);)*
++                #statements
+                 #buffer
+-            }
++            })
+         }
+     }
+ }
+ 
+ impl HtmlNode {
+-    pub fn to_tokens(&self) -> TokenStream {
++    /// Appends the statements that write this node.
++    fn write(&self, out: &mut Writer, helpers: &mut Helpers) {
+         match self {
+-            HtmlNode::Element(el) => el.to_tokens(),
+-            HtmlNode::Text(txt) => {
+-                let val = txt.value();
+-                quote! { #val.to_string() }
+-            }
++            HtmlNode::Element(el) => el.write(out, helpers),
++            HtmlNode::Text(txt) => out.text(&txt.value()),
+             HtmlNode::Block(expr) => {
+-                quote! { rullst::html::escape(&(#expr)) }
++                let tokens = write::escaped_text(out.buffer(), expr);
++                out.code(tokens);
++            }
++            HtmlNode::If(node) => node.write(out, helpers),
++            HtmlNode::For(node) => node.write(out, helpers),
++            HtmlNode::Match(node) => node.write(out, helpers),
++        }
++    }
++
++    /// Whether an expression of this node, outside the bodies of `@for`
++    /// blocks it contains, mentions `continue` or `break`.
++    fn mentions_loop_exit(&self) -> bool {
++        match self {
++            HtmlNode::Element(el) => {
++                el.attributes.iter().any(HtmlAttribute::mentions_loop_exit)
++                    || el.children.iter().any(HtmlNode::mentions_loop_exit)
+             }
+-            HtmlNode::If(node) => node.to_tokens(),
+-            HtmlNode::For(node) => node.to_tokens(),
+-            HtmlNode::Match(node) => node.to_tokens(),
++            HtmlNode::Text(_) => false,
++            HtmlNode::Block(expr) => write::expr_mentions_loop_exit(expr),
++            HtmlNode::If(node) => node.mentions_loop_exit(),
++            HtmlNode::For(node) => write::expr_mentions_loop_exit(&node.iterable),
++            HtmlNode::Match(node) => node.mentions_loop_exit(),
+         }
+     }
+ 
+@@ -209,6 +227,12 @@ impl HtmlNode {
+     }
+ }
+ 
++/// Elements written `<name />`, which take no closing tag.
++const VOID_ELEMENTS: [&str; 14] = [
++    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
++    "track", "wbr",
++];
++
+ impl HtmlElement {
+     pub fn static_size(&self) -> usize {
+         let tag = self.tag_name.to_string();
+@@ -224,68 +248,27 @@ impl HtmlElement {
+         size
+     }
+ 
+-    pub fn to_tokens(&self) -> TokenStream {
++    /// Appends the statements that write the element, its attributes and
++    /// its children.
++    fn write(&self, out: &mut Writer, helpers: &mut Helpers) {
+         let tag = self.tag_name.to_string();
+-        let capacity = self.static_size();
+-        // Use one hygienic binding for this element and all its attribute
+-        // writes; interpolated caller expressions retain their original spans.
+-        let buffer = Ident::new("s", Span::mixed_site());
+-
+         let allow_data_urls = allows_data_urls(&tag);
+-        let mut needs_url_guard = false;
+-        let mut attr_tokens = Vec::new();
++        out.text("<");
++        out.text(&tag);
+         for attr in &self.attributes {
+-            let (tokens, uses_url_guard) = attr.to_tokens(&buffer, allow_data_urls);
+-            needs_url_guard |= uses_url_guard;
+-            attr_tokens.push(tokens);
++            attr.write(out, helpers, allow_data_urls);
+         }
+-        // Local helper items: the URL guard and the `Option` value probe.
+-        let mut helpers = if needs_url_guard {
+-            url_guard_tokens()
+-        } else {
+-            TokenStream::new()
+-        };
+-        if self.attributes.iter().any(HtmlAttribute::is_dynamic) {
+-            helpers.extend(option_value_probe_tokens());
++        if self.children.is_empty() && VOID_ELEMENTS.contains(&tag.as_str()) {
++            out.text(" />");
++            return;
+         }
+-
+-        let child_tokens = self.children.iter().map(|child| child.to_tokens());
+-
+-        let void_elements = [
+-            "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+-            "source", "track", "wbr",
+-        ];
+-        let is_void = void_elements.contains(&tag.as_str());
+-
+-        if self.children.is_empty() && is_void {
+-            quote! {
+-                {
+-                    #helpers
+-                    let mut #buffer = String::with_capacity(#capacity);
+-                    #buffer.push_str("<");
+-                    #buffer.push_str(#tag);
+-                    #( #attr_tokens )*
+-                    #buffer.push_str(" />");
+-                    #buffer
+-                }
+-            }
+-        } else {
+-            quote! {
+-                {
+-                    #helpers
+-                    let mut #buffer = String::with_capacity(#capacity);
+-                    #buffer.push_str("<");
+-                    #buffer.push_str(#tag);
+-                    #( #attr_tokens )*
+-                    #buffer.push_str(">");
+-                    #( #buffer.push_str(&#child_tokens); )*
+-                    #buffer.push_str("</");
+-                    #buffer.push_str(#tag);
+-                    #buffer.push_str(">");
+-                    #buffer
+-                }
+-            }
++        out.text(">");
++        for child in &self.children {
++            child.write(out, helpers);
+         }
++        out.text("</");
++        out.text(&tag);
++        out.text(">");
+     }
+ }
+ 
+@@ -346,18 +329,13 @@ mod kani_proofs {
+ 
+     #[kani::proof]
+     fn verify_void_elements_check() {
+-        let void_elements = [
+-            "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+-            "source", "track", "wbr",
+-        ];
+-
+         let i: usize = kani::any();
+-        kani::assume(i < void_elements.len());
++        kani::assume(i < VOID_ELEMENTS.len());
+ 
+-        let tag = void_elements[i];
++        let tag = VOID_ELEMENTS[i];
+ 
+         // Assert that the parsing logic's void element check works correctly
+-        let is_void = void_elements.contains(&tag);
++        let is_void = VOID_ELEMENTS.contains(&tag);
+         assert!(is_void);
+     }
+ }
+diff --git a/rullst-macros/src/html_parser_tests.rs b/rullst-macros/src/html_parser_tests.rs
+index fec53b739..618483a3a 100644
+--- a/rullst-macros/src/html_parser_tests.rs
++++ b/rullst-macros/src/html_parser_tests.rs
+@@ -171,10 +171,10 @@ fn static_attribute_values_escape_double_quotes_only() {
+     .to_tokens()
+     .to_string();
+     assert!(
+-        tokens.contains(r#"" content=\"{&quot;includeIndicatorStyles&quot;:false}\"""#),
++        tokens.contains(r#" content=\"{&quot;includeIndicatorStyles&quot;:false}\" "#),
+         "{tokens}"
+     );
+-    assert!(tokens.contains(r#"" title=\"a &amp; <b>\"""#), "{tokens}");
++    assert!(tokens.contains(r#" title=\"a &amp; <b>\" />""#), "{tokens}");
+     // The capacity hint counts the written text.
+     let attribute = super::attributes::HtmlAttribute {
+         name: "content".to_string(),
+@@ -409,7 +409,7 @@ fn capacity_hints_add_tags_attributes_children_and_text() {
+     // and nothing for `{x}`.
+     assert_eq!(element.static_size(), 39);
+     assert_eq!(div.static_size(), 39);
+-    let tokens = div.to_tokens().to_string();
++    let tokens = document.to_tokens().to_string();
+     assert!(
+         tokens.contains("String :: with_capacity (39usize)"),
+         "{tokens}"
+diff --git a/rullst-macros/src/html_write.rs b/rullst-macros/src/html_write.rs
+new file mode 100644
+index 000000000..be709401e
+--- /dev/null
++++ b/rullst-macros/src/html_write.rs
+@@ -0,0 +1,144 @@
++//! The statements of an `html!` expansion. Every node writes into one
++//! `String`: text known at compile time is joined into one `push_str` per
++//! run, and interpolated values are escaped (numbers formatted) into the same
++//! buffer, so a page allocates its buffer once instead of a `String` per
++//! element and per value.
++//!
++//! `continue` and `break` inside an `@for` body leave the expansion's loop in
++//! the middle of a node. Each node used to build its own `String`, so the
++//! node they cut short wrote nothing; a top-level body node that mentions
++//! either keyword still writes into a buffer of its own, which is appended
++//! only when the node completes.
++
++use proc_macro2::{Span, TokenStream, TokenTree};
++use quote::{ToTokens, quote};
++use syn::{Expr, Ident};
++
++use super::HtmlNode;
++
++/// Collects the statements that write into one buffer.
++pub(super) struct Writer {
++    buffer: Ident,
++    /// How many node buffers enclose this one (see [`write_loop_body`]).
++    depth: usize,
++    statements: TokenStream,
++    text: String,
++}
++
++impl Writer {
++    pub(super) fn new(buffer: Ident, depth: usize) -> Self {
++        Self {
++            buffer,
++            depth,
++            statements: TokenStream::new(),
++            text: String::new(),
++        }
++    }
++
++    /// A writer for a block body (`@if`, `@for` or `@match`) that writes
++    /// into the same buffer.
++    pub(super) fn body(&self) -> Self {
++        Self::new(self.buffer.clone(), self.depth)
++    }
++
++    pub(super) fn buffer(&self) -> &Ident {
++        &self.buffer
++    }
++
++    /// Appends text known at compile time.
++    pub(super) fn text(&mut self, text: &str) {
++        self.text.push_str(text);
++    }
++
++    /// Appends statements, after the text written before them.
++    pub(super) fn code(&mut self, tokens: TokenStream) {
++        self.flush();
++        self.statements.extend(tokens);
++    }
++
++    fn flush(&mut self) {
++        if !self.text.is_empty() {
++            let text = std::mem::take(&mut self.text);
++            let buffer = &self.buffer;
++            self.statements.extend(quote! { #buffer.push_str(#text); });
++        }
++    }
++
++    pub(super) fn finish(mut self) -> TokenStream {
++        self.flush();
++        self.statements
++    }
++}
++
++/// Local items the expansion needs once, whichever elements use them.
++#[derive(Default)]
++pub(super) struct Helpers {
++    pub(super) url_guard: bool,
++    pub(super) option_probe: bool,
++}
++
++impl Helpers {
++    pub(super) fn to_tokens(&self) -> TokenStream {
++        let mut tokens = TokenStream::new();
++        if self.url_guard {
++            tokens.extend(super::attributes::url_guard_tokens());
++        }
++        if self.option_probe {
++            tokens.extend(super::attributes::option_value_probe_tokens());
++        }
++        tokens
++    }
++}
++
++/// Writes `{expr}`: the value escaped as text, straight into the buffer.
++pub(super) fn escaped_text(buffer: &Ident, expr: &Expr) -> TokenStream {
++    quote! { rullst::html::push_escaped(&mut #buffer, &(#expr)); }
++}
++
++/// Writes `value` (a reference) escaped for a double-quoted attribute.
++pub(super) fn escaped_attribute(buffer: &Ident, value: &Ident) -> TokenStream {
++    quote! { rullst::html::push_escaped_attr(&mut #buffer, #value); }
++}
++
++/// Writes the nodes of an `@for` body. A node that mentions `continue` or
++/// `break` writes into a buffer of its own, appended when it completes.
++pub(super) fn write_loop_body(body: &[HtmlNode], out: &mut Writer, helpers: &mut Helpers) {
++    for node in body {
++        if !node.mentions_loop_exit() {
++            node.write(out, helpers);
++            continue;
++        }
++        let depth = out.depth + 1;
++        let own = Ident::new(&format!("s{depth}"), Span::mixed_site());
++        let mut inner = Writer::new(own.clone(), depth);
++        node.write(&mut inner, helpers);
++        let statements = inner.finish();
++        let capacity = node.static_size();
++        let buffer = out.buffer().clone();
++        out.code(quote! {
++            {
++                let mut #own = String::with_capacity(#capacity);
++                #statements
++                #buffer.push_str(&#own);
++            }
++        });
++    }
++}
++
++/// Whether `expr` contains the keyword `continue` or `break` anywhere, even
++/// where it leaves a loop of its own.
++pub(super) fn expr_mentions_loop_exit(expr: &Expr) -> bool {
++    mentions_loop_exit(expr.to_token_stream())
++}
++
++fn mentions_loop_exit(tokens: TokenStream) -> bool {
++    tokens.into_iter().any(|token| match token {
++        TokenTree::Ident(ident) => ident == "continue" || ident == "break",
++        TokenTree::Group(group) => mentions_loop_exit(group.stream()),
++        TokenTree::Punct(_) | TokenTree::Literal(_) => false,
++    })
++}
++
++#[cfg(test)]
++#[path = "html_write_tests.rs"]
++mod tests;
+diff --git a/rullst-macros/src/html_write_tests.rs b/rullst-macros/src/html_write_tests.rs
+new file mode 100644
+index 000000000..496fcb0c3
+--- /dev/null
++++ b/rullst-macros/src/html_write_tests.rs
+@@ -0,0 +1,179 @@
++//! The statements the expansion writes, asserted on the generated tokens:
++//! text joined into one `push_str` per run, one buffer for the whole
++//! document, and a buffer of its own for an `@for` body node that mentions
++//! `continue` or `break`.
++
++use proc_macro2::Span;
++use syn::Ident;
++
++use super::super::HtmlDocument;
++use super::{Writer, expr_mentions_loop_exit};
++
++fn expansion(source: &str) -> String {
++    match syn::parse_str::<HtmlDocument>(source) {
++        Ok(document) => document.to_tokens().to_string(),
++        Err(error) => panic!("expected {source} to parse: {error}"),
++    }
++}
++
++fn count(haystack: &str, needle: &str) -> usize {
++    haystack.matches(needle).count()
++}
++
++#[test]
++fn adjacent_text_is_written_by_one_push() {
++    let tokens = expansion(r#"<!DOCTYPE html><html><head><title>"T"</title></head></html>"#);
++    assert!(
++        tokens.contains(
++            r#"s . push_str ("<!DOCTYPE html><html><head><title>T</title></head></html>") ;"#
++        ),
++        "{tokens}"
++    );
++    assert_eq!(count(&tokens, "push_str"), 1, "{tokens}");
++    assert_eq!(count(&tokens, "String :: with_capacity"), 1, "{tokens}");
++}
++
++#[test]
++fn values_split_the_text_around_them() {
++    let tokens = expansion("<tr><td>{id}</td><td>{message}</td></tr>");
++    for expected in [
++        r#"s . push_str ("<tr><td>") ;"#,
++        "rullst :: html :: push_escaped (& mut s , & (id)) ;",
++        r#"s . push_str ("</td><td>") ;"#,
++        "rullst :: html :: push_escaped (& mut s , & (message)) ;",
++        r#"s . push_str ("</td></tr>") ;"#,
++    ] {
++        assert!(tokens.contains(expected), "{expected} in {tokens}");
++    }
++    assert_eq!(count(&tokens, "String :: with_capacity"), 1, "{tokens}");
++    assert!(tokens.ends_with("s })"), "{tokens}");
++}
++
++#[test]
++fn control_blocks_write_into_the_document_buffer() {
++    let tokens = expansion(
++        r#"<ul>@for row in rows { <li>{row}</li> }</ul>@if a { "x" } @else { "y" }@match m { 0 => { "z" } _ => {} }"#,
++    );
++    assert_eq!(count(&tokens, "String :: with_capacity"), 1, "{tokens}");
++    assert_eq!(count(&tokens, "String :: new"), 0, "{tokens}");
++    for expected in [
++        r#"for row in rows { s . push_str ("<li>") ;"#,
++        r#"if a { s . push_str ("x") ; } else { s . push_str ("y") ; }"#,
++        r#"match m { 0 => { s . push_str ("z") ; } _ => { } }"#,
++    ] {
++        assert!(tokens.contains(expected), "{expected} in {tokens}");
++    }
++}
++
++#[test]
++fn a_loop_body_node_that_can_leave_the_loop_writes_into_its_own_buffer() {
++    let tokens = expansion(
++        r#"<ul>@for row in rows { <b>"kept"</b> <li>{{ if row.skip { continue } row.name }}</li> "end" }</ul>"#,
++    );
++    // `<li>` is 9 bytes at least (`<li></li>`).
++    assert!(
++        tokens.contains(
++            r#"{ let mut s1 = String :: with_capacity (9usize) ; s1 . push_str ("<li>") ;"#
++        ),
++        "{tokens}"
++    );
++    assert!(
++        tokens.contains(r#"s1 . push_str ("</li>") ; s . push_str (& s1) ; }"#),
++        "{tokens}"
++    );
++    // The nodes before and after it write into the document buffer.
++    assert!(
++        tokens.contains(r#"s . push_str ("<b>kept</b>") ;"#),
++        "{tokens}"
++    );
++    assert!(tokens.contains(r#"s . push_str ("end") ;"#), "{tokens}");
++    // Outside a loop body the same node needs no buffer of its own.
++    let tokens = expansion("<li>{{ if skip { continue } name }}</li>");
++    assert!(!tokens.contains("s1"), "{tokens}");
++}
++
++#[test]
++fn nested_node_buffers_are_numbered_by_depth() {
++    let tokens = expansion(
++        "@for row in rows { <p>@for cell in { if row.empty { break } row.cells } { <i>{{ if cell.hidden { continue } cell }}</i> }</p> }",
++    );
++    assert!(
++        tokens.contains("let mut s1 = String :: with_capacity (7usize)"),
++        "{tokens}"
++    );
++    assert!(
++        tokens.contains("let mut s2 = String :: with_capacity (7usize)"),
++        "{tokens}"
++    );
++    assert!(tokens.contains("s1 . push_str (& s2) ;"), "{tokens}");
++    assert!(tokens.contains("s . push_str (& s1) ;"), "{tokens}");
++}
++
++#[test]
++fn only_continue_and_break_count_as_leaving_a_loop() {
++    for (source, leaves) in [
++        ("continue", true),
++        ("break", true),
++        ("{ if x { break } y }", true),
++        ("f(|| loop { break })", true),
++        ("[a, (b, { continue })]", true),
++        ("return x", false),
++        ("x?", false),
++        ("breaking + continued", false),
++        (r#""break""#, false),
++        ("'a: { 1 }", false),
++    ] {
++        let expr: syn::Expr = match syn::parse_str(source) {
++            Ok(expr) => expr,
++            Err(error) => panic!("{source}: {error}"),
++        };
++        assert_eq!(expr_mentions_loop_exit(&expr), leaves, "{source}");
++    }
++}
++
++#[test]
++fn only_the_expressions_of_a_node_decide_whether_it_can_leave_a_loop() {
++    for (source, leaves) in [
++        ("<p>{continue}</p>", true),
++        ("<a href={break}></a>", true),
++        ("<a href?={continue}></a>", true),
++        ("<a href=\"break\" continue></a>", false),
++        ("<p>break continue</p>", false),
++        ("@if { continue } { }", true),
++        ("@if a { } @else if { break } { }", true),
++        ("@if a { } @else { {break} }", true),
++        ("@if a { <i>{continue}</i> }", true),
++        ("@if a { } @else { }", false),
++        ("@match { break } { _ => {} }", true),
++        ("@match m { _ if { continue } => {} _ => {} }", true),
++        ("@match m { _ => { {break} } }", true),
++        ("@match m { _ => {} }", false),
++        // `continue` in the body of an inner `@for` leaves the inner loop.
++        ("@for x in { break } { }", true),
++        ("@for x in xs { {continue} }", false),
++    ] {
++        let document = match syn::parse_str::<HtmlDocument>(source) {
++            Ok(document) => document,
++            Err(error) => panic!("{source}: {error}"),
++        };
++        let [node] = &document.nodes[..] else {
++            panic!("expected one node for {source}");
++        };
++        assert_eq!(node.mentions_loop_exit(), leaves, "{source}");
++    }
++}
++
++#[test]
++fn text_written_before_code_is_flushed_first() {
++    let mut writer = Writer::new(Ident::new("out", Span::call_site()), 0);
++    writer.text("a");
++    writer.text("b");
++    writer.code(quote::quote! { f(); });
++    writer.text("c");
++    assert_eq!(
++        writer.finish().to_string(),
++        r#"out . push_str ("ab") ; f () ; out . push_str ("c") ;"#
++    );
++    let empty = Writer::new(Ident::new("out", Span::call_site()), 0);
++    assert_eq!(empty.finish().to_string(), "");
++}
+diff --git a/rullst-macros/src/lib.rs b/rullst-macros/src/lib.rs
+index 379ea336d..cf00a896f 100644
+--- a/rullst-macros/src/lib.rs
++++ b/rullst-macros/src/lib.rs
+@@ -38,8 +38,9 @@ mod memoize_tests;
+ mod require_role_tests;
+ 
+ /// A macro for writing HTML inline in Rust.
+-/// It compiles down to highly optimized string concatenations at compile time,
+-/// and automatically escapes dynamic variables to prevent XSS.
++/// It compiles to code that writes the page into one `String` (text known at
++/// compile time is joined into one write per run), and automatically escapes
++/// dynamic variables to prevent XSS.
+ ///
+ /// The result is a `rullst::html::Markup`: escaped HTML that a handler can
+ /// return directly (`text/html; charset=utf-8`) and that another `html!`

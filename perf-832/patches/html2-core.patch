@@ -1,0 +1,491 @@
+diff --git a/rullst-core/src/html.rs b/rullst-core/src/html.rs
+index 57efc5e64..35ed80efb 100644
+--- a/rullst-core/src/html.rs
++++ b/rullst-core/src/html.rs
+@@ -12,6 +12,23 @@ pub trait HtmlEscape {
+     fn escape_attribute(&self) -> Cow<'_, str> {
+         self.escape_html()
+     }
++
++    /// Appends [`HtmlEscape::escape_html`] to `out`. `html!` writes every
++    /// `{value}` through it into the page's one buffer; the implementations
++    /// in this crate write the same text without an intermediate string.
++    #[doc(hidden)]
++    #[inline]
++    fn push_html(&self, out: &mut String) {
++        out.push_str(&self.escape_html());
++    }
++
++    /// Appends [`HtmlEscape::escape_attribute`] to `out`, as
++    /// [`HtmlEscape::push_html`] does for text.
++    #[doc(hidden)]
++    #[inline]
++    fn push_attribute(&self, out: &mut String) {
++        out.push_str(&self.escape_attribute());
++    }
+ }
+ 
+ #[path = "html_markup.rs"]
+@@ -20,7 +37,11 @@ pub use markup::Markup;
+ 
+ #[path = "html_attribute.rs"]
+ mod attribute;
++
++#[path = "html_push.rs"]
++mod push;
+ pub use attribute::{AttributePresence, OptionalAttribute};
++use push::{push_decimal, push_escaped_str, push_wide_decimal};
+ // Used by `html!` for `name?={value}` attributes.
+ #[doc(hidden)]
+ pub use attribute::optional_attr;
+@@ -61,6 +82,27 @@ impl HtmlEscape for RawHtml {
+     fn escape_html(&self) -> Cow<'_, str> {
+         Cow::Borrowed(&self.0)
+     }
++
++    fn push_html(&self, out: &mut String) {
++        out.push_str(&self.0);
++    }
++
++    fn push_attribute(&self, out: &mut String) {
++        out.push_str(&self.0);
++    }
++}
++
++// Text is escaped as `escape_str` escapes it, without the intermediate string.
++macro_rules! push_escaped_text {
++    () => {
++        fn push_html(&self, out: &mut String) {
++            push_escaped_str(out, self);
++        }
++
++        fn push_attribute(&self, out: &mut String) {
++            push_escaped_str(out, self);
++        }
++    };
+ }
+ 
+ #[cfg_attr(mutants, mutants::skip)]
+@@ -68,18 +110,24 @@ impl HtmlEscape for String {
+     fn escape_html(&self) -> Cow<'_, str> {
+         escape_str(self)
+     }
++
++    push_escaped_text!();
+ }
+ 
+ impl HtmlEscape for &str {
+     fn escape_html(&self) -> Cow<'_, str> {
+         escape_str(self)
+     }
++
++    push_escaped_text!();
+ }
+ 
+ impl<'a> HtmlEscape for Cow<'a, str> {
+     fn escape_html(&self) -> Cow<'_, str> {
+         escape_str(self.as_ref())
+     }
++
++    push_escaped_text!();
+ }
+ 
+ #[cfg_attr(mutants, mutants::skip)]
+@@ -91,6 +139,14 @@ impl<T: HtmlEscape + ?Sized> HtmlEscape for &T {
+     fn escape_attribute(&self) -> Cow<'_, str> {
+         (*self).escape_attribute()
+     }
++
++    fn push_html(&self, out: &mut String) {
++        (*self).push_html(out);
++    }
++
++    fn push_attribute(&self, out: &mut String) {
++        (*self).push_attribute(out);
++    }
+ }
+ 
+ /// `None` renders nothing; `Some(value)` renders `value` as usual.
+@@ -108,24 +164,60 @@ impl<T: HtmlEscape> HtmlEscape for Option<T> {
+             None => Cow::Borrowed(""),
+         }
+     }
++
++    fn push_html(&self, out: &mut String) {
++        if let Some(value) = self {
++            value.push_html(out);
++        }
++    }
++
++    fn push_attribute(&self, out: &mut String) {
++        if let Some(value) = self {
++            value.push_attribute(out);
++        }
++    }
+ }
+ 
+-// Automatically treat numbers and booleans as safe since they cannot contain HTML characters
++// Automatically treat numbers and booleans as safe since they cannot contain
++// HTML characters. `html!` writes them straight into its buffer, with the
++// text `to_string` writes: integers through `push`, floats and booleans with
++// their `Display` implementation.
+ macro_rules! impl_safe_primitives {
+-    ($($t:ty),*) => {
++    ($($t:ty),* => |$value:ident, $out:ident| $push:expr) => {
+         $(
+             impl HtmlEscape for $t {
+                 fn escape_html(&self) -> Cow<'_, str> {
+                     Cow::Owned(self.to_string())
+                 }
++
++                fn push_html(&self, $out: &mut String) {
++                    let $value = *self;
++                    $push
++                }
++
++                fn push_attribute(&self, out: &mut String) {
++                    self.push_html(out);
++                }
+             }
+         )*
+     };
+ }
+ 
+-impl_safe_primitives!(
+-    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64, bool
+-);
++impl_safe_primitives!(u8, u16, u32, u64, usize => |value, out| {
++    push_decimal(out, false, value as u64)
++});
++impl_safe_primitives!(i8, i16, i32, i64, isize => |value, out| {
++    push_decimal(out, value < 0, (value as i64).unsigned_abs())
++});
++impl_safe_primitives!(u128 => |value, out| push_wide_decimal(out, false, value));
++impl_safe_primitives!(i128 => |value, out| {
++    push_wide_decimal(out, value < 0, value.unsigned_abs())
++});
++impl_safe_primitives!(f32, f64, bool => |value, out| {
++    use std::fmt::Write as _;
++    // Writing to a `String` cannot fail.
++    let _ = write!(out, "{value}");
++});
+ 
+ /// Helper function to escape standard strings
+ #[cfg_attr(mutants, mutants::skip)]
+@@ -168,6 +260,21 @@ pub fn escape<T: HtmlEscape + ?Sized>(val: &T) -> Cow<'_, str> {
+     val.escape_html()
+ }
+ 
++/// Writes `{value}` into the buffer of an `html!` expansion.
++#[doc(hidden)]
++#[inline(always)]
++pub fn push_escaped<T: HtmlEscape + ?Sized>(out: &mut String, val: &T) {
++    val.push_html(out);
++}
++
++/// Writes the value of `name={value}` into the buffer of an `html!`
++/// expansion.
++#[doc(hidden)]
++#[inline(always)]
++pub fn push_escaped_attr<T: HtmlEscape + ?Sized>(out: &mut String, val: &T) {
++    val.push_attribute(out);
++}
++
+ /// Helper function to escape attribute values (see
+ /// [`HtmlEscape::escape_attribute`]).
+ #[inline(always)]
+@@ -225,6 +332,10 @@ mod macro_tests;
+ #[path = "html_syntax_tests.rs"]
+ mod syntax_tests;
+ 
++#[cfg(test)]
++#[path = "html_push_tests.rs"]
++mod push_tests;
++
+ #[cfg(kani)]
+ #[cfg_attr(mutants, mutants::skip)]
+ mod kani_proofs {
+diff --git a/rullst-core/src/html_markup.rs b/rullst-core/src/html_markup.rs
+index 23243f98b..eaa03d6cf 100644
+--- a/rullst-core/src/html_markup.rs
++++ b/rullst-core/src/html_markup.rs
+@@ -98,6 +98,14 @@ impl HtmlEscape for Markup {
+     fn escape_attribute(&self) -> Cow<'_, str> {
+         super::escape_str(&self.0)
+     }
++
++    fn push_html(&self, out: &mut String) {
++        out.push_str(&self.0);
++    }
++
++    fn push_attribute(&self, out: &mut String) {
++        super::push_escaped_str(out, &self.0);
++    }
+ }
+ 
+ impl From<RawHtml> for Markup {
+diff --git a/rullst-core/src/html_push.rs b/rullst-core/src/html_push.rs
+new file mode 100644
+index 000000000..7bec88d2b
+--- /dev/null
++++ b/rullst-core/src/html_push.rs
+@@ -0,0 +1,63 @@
++//! How `html!` writes values into its buffer without an intermediate
++//! `String`: text escaped as [`super::escape_str`] escapes it, and integers
++//! in decimal as `Display` writes them.
++
++/// Appends `s` to `out`, escaped exactly as [`super::escape_str`] escapes it.
++pub(super) fn push_escaped_str(out: &mut String, s: &str) {
++    let mut last_pos = 0;
++    for (i, &b) in s.as_bytes().iter().enumerate() {
++        let replacement = match b {
++            b'<' => "&lt;",
++            b'>' => "&gt;",
++            b'&' => "&amp;",
++            b'"' => "&quot;",
++            b'\'' => "&#x27;",
++            _ => continue,
++        };
++        out.push_str(&s[last_pos..i]);
++        out.push_str(replacement);
++        last_pos = i + 1;
++    }
++    out.push_str(&s[last_pos..]);
++}
++
++/// Appends `value` in decimal, after a `-` when `negative`, as `Display`
++/// writes an integer of 64 bits or fewer.
++pub(super) fn push_decimal(out: &mut String, negative: bool, mut value: u64) {
++    // `u64::MAX` has 20 digits.
++    let mut digits = [0u8; 20];
++    let mut start = digits.len();
++    loop {
++        start -= 1;
++        digits[start] = b'0' + (value % 10) as u8;
++        value /= 10;
++        if value == 0 {
++            break;
++        }
++    }
++    push_digits(out, negative, &digits[start..]);
++}
++
++/// [`push_decimal`] for 128-bit integers.
++pub(super) fn push_wide_decimal(out: &mut String, negative: bool, mut value: u128) {
++    // `u128::MAX` has 39 digits.
++    let mut digits = [0u8; 39];
++    let mut start = digits.len();
++    loop {
++        start -= 1;
++        digits[start] = b'0' + (value % 10) as u8;
++        value /= 10;
++        if value == 0 {
++            break;
++        }
++    }
++    push_digits(out, negative, &digits[start..]);
++}
++
++fn push_digits(out: &mut String, negative: bool, digits: &[u8]) {
++    if negative {
++        out.push('-');
++    }
++    // Only ASCII digits were written, so the conversion cannot fail.
++    out.push_str(std::str::from_utf8(digits).unwrap_or_default());
++}
+diff --git a/rullst-core/src/html_push_tests.rs b/rullst-core/src/html_push_tests.rs
+new file mode 100644
+index 000000000..b2f022a0e
+--- /dev/null
++++ b/rullst-core/src/html_push_tests.rs
+@@ -0,0 +1,190 @@
++//! `HtmlEscape::push_html` and `push_attribute`, which `html!` calls to write
++//! values into its one buffer: each appends the text `escape_html` and
++//! `escape_attribute` return, and numbers are formatted as `to_string`
++//! formats them.
++
++#![allow(clippy::unwrap_used, clippy::expect_used)]
++
++use std::borrow::Cow;
++
++use super::{HtmlEscape, Markup, RawHtml, escape_str, push_escaped, push_escaped_attr};
++
++fn html<T: HtmlEscape + ?Sized>(value: &T) -> String {
++    let mut out = String::from("[");
++    value.push_html(&mut out);
++    out
++}
++
++fn attribute<T: HtmlEscape + ?Sized>(value: &T) -> String {
++    let mut out = String::from("[");
++    value.push_attribute(&mut out);
++    out
++}
++
++#[test]
++fn text_is_escaped_as_escape_str_escapes_it() {
++    for (text, escaped) in [
++        ("", "["),
++        ("plain", "[plain"),
++        ("<", "[&lt;"),
++        (">", "[&gt;"),
++        ("&", "[&amp;"),
++        ("\"", "[&quot;"),
++        ("'", "[&#x27;"),
++        ("a<b>c&d\"e'f", "[a&lt;b&gt;c&amp;d&quot;e&#x27;f"),
++        ("<<>>", "[&lt;&lt;&gt;&gt;"),
++        ("<x", "[&lt;x"),
++        ("x>", "[x&gt;"),
++        ("é<ü>ñ", "[é&lt;ü&gt;ñ"),
++        ("フ&レ", "[フ&amp;レ"),
++    ] {
++        assert_eq!(html(&text), escaped, "{text:?}");
++        assert_eq!(attribute(&text), escaped, "{text:?}");
++        assert_eq!(html(&String::from(text)), escaped, "{text:?}");
++        assert_eq!(attribute(&String::from(text)), escaped, "{text:?}");
++        assert_eq!(html(&Cow::Borrowed(text)), escaped, "{text:?}");
++        assert_eq!(attribute(&Cow::<str>::Owned(text.to_string())), escaped);
++        assert_eq!(&escaped[1..], escape_str(text), "{text:?}");
++    }
++    // Every ASCII character, against `escape_str`.
++    for byte in 0u8..128 {
++        let text = char::from(byte).to_string();
++        assert_eq!(html(&text.as_str())[1..], escape_str(&text), "{byte}");
++    }
++}
++
++#[test]
++fn numbers_and_booleans_are_formatted_as_to_string_formats_them() {
++    assert_eq!(html(&-42_i32), "[-42");
++    assert_eq!(attribute(&-42_i32), "[-42");
++    assert_eq!(html(&u64::MAX), "[18446744073709551615");
++    assert_eq!(
++        attribute(&i128::MIN),
++        "[-170141183460469231731687303715884105728"
++    );
++    assert_eq!(html(&0_u8), "[0");
++    assert_eq!(html(&1.5_f64), "[1.5");
++    assert_eq!(attribute(&-0.0_f32), "[-0");
++    assert_eq!(html(&f64::NAN), "[NaN");
++    assert_eq!(html(&f64::NEG_INFINITY), "[-inf");
++    assert_eq!(html(&1e21_f64), "[1000000000000000000000");
++    assert_eq!(html(&true), "[true");
++    assert_eq!(attribute(&false), "[false");
++}
++
++#[test]
++fn integers_are_written_digit_for_digit() {
++    for (value, text) in [
++        (0_u64, "[0"),
++        (9, "[9"),
++        (10, "[10"),
++        (99, "[99"),
++        (100, "[100"),
++        (1_234_567_890, "[1234567890"),
++        (u64::MAX, "[18446744073709551615"),
++    ] {
++        assert_eq!(html(&value), text);
++    }
++    assert_eq!(html(&-1_i64), "[-1");
++    assert_eq!(html(&i64::MIN), "[-9223372036854775808");
++    assert_eq!(html(&i64::MAX), "[9223372036854775807");
++    assert_eq!(html(&i8::MIN), "[-128");
++    assert_eq!(html(&-10_isize), "[-10");
++    assert_eq!(html(&u128::MAX), "[340282366920938463463374607431768211455");
++    assert_eq!(html(&0_u128), "[0");
++    assert_eq!(html(&-7_i128), "[-7");
++    assert_eq!(html(&i128::MAX), "[170141183460469231731687303715884105727");
++    // Every 16-bit value, and powers of ten around every width, against
++    // `to_string`.
++    for value in i16::MIN..=i16::MAX {
++        assert_eq!(html(&value)[1..], value.to_string());
++    }
++    for value in u16::MIN..=u16::MAX {
++        assert_eq!(attribute(&value)[1..], value.to_string());
++    }
++    let mut power = 1_u128;
++    while let Some(next) = power.checked_mul(10) {
++        for value in [power - 1, power, power + 1] {
++            assert_eq!(html(&value)[1..], value.to_string());
++            if let Ok(narrow) = u64::try_from(value) {
++                assert_eq!(html(&narrow)[1..], narrow.to_string());
++                assert_eq!(html(&(narrow as usize))[1..], (narrow as usize).to_string());
++            }
++            if let Ok(signed) = i128::try_from(value) {
++                assert_eq!(html(&-signed)[1..], (-signed).to_string());
++            }
++            if let Ok(signed) = i64::try_from(value) {
++                assert_eq!(html(&-signed)[1..], (-signed).to_string());
++                assert_eq!(attribute(&signed)[1..], signed.to_string());
++            }
++        }
++        power = next;
++    }
++    assert_eq!(html(&u32::MAX), "[4294967295");
++    assert_eq!(html(&i32::MIN), "[-2147483648");
++    assert_eq!(html(&u8::MAX), "[255");
++}
++
++#[test]
++fn wrappers_delegate_to_their_value() {
++    assert_eq!(html(&&"<a>"), "[&lt;a&gt;");
++    assert_eq!(attribute(&&&"<a>"), "[&lt;a&gt;");
++    assert_eq!(html(&Some("<a>")), "[&lt;a&gt;");
++    assert_eq!(attribute(&Some(7_u16)), "[7");
++    assert_eq!(html(&None::<&str>), "[");
++    assert_eq!(attribute(&None::<i32>), "[");
++    assert_eq!(html(&Some(Some("&"))), "[&amp;");
++}
++
++#[test]
++fn markup_is_inserted_as_html_and_escaped_in_attributes() {
++    let markup = Markup::from_trusted("<b title=\"t\">x & y</b>");
++    assert_eq!(html(&markup), "[<b title=\"t\">x & y</b>");
++    assert_eq!(
++        attribute(&markup),
++        "[&lt;b title=&quot;t&quot;&gt;x &amp; y&lt;/b&gt;"
++    );
++    let raw = RawHtml::new("<i>'raw'</i>");
++    assert_eq!(html(&raw), "[<i>'raw'</i>");
++    assert_eq!(attribute(&raw), "[<i>'raw'</i>");
++}
++
++/// An application type that implements only the required method, and one
++/// that also escapes attributes its own way.
++struct Shout(&'static str);
++
++impl HtmlEscape for Shout {
++    fn escape_html(&self) -> Cow<'_, str> {
++        Cow::Owned(self.0.to_uppercase())
++    }
++}
++
++struct Quoted;
++
++impl HtmlEscape for Quoted {
++    fn escape_html(&self) -> Cow<'_, str> {
++        Cow::Borrowed("text")
++    }
++
++    fn escape_attribute(&self) -> Cow<'_, str> {
++        Cow::Borrowed("attribute")
++    }
++}
++
++#[test]
++fn the_default_methods_append_what_escape_html_and_escape_attribute_return() {
++    assert_eq!(html(&Shout("hi")), "[HI");
++    assert_eq!(attribute(&Shout("hi")), "[HI");
++    assert_eq!(html(&Quoted), "[text");
++    assert_eq!(attribute(&Quoted), "[attribute");
++}
++
++#[test]
++fn the_expansion_helpers_dispatch_to_the_value() {
++    let mut out = String::from("<p>");
++    push_escaped(&mut out, &Quoted);
++    push_escaped(&mut out, &3_i8);
++    push_escaped_attr(&mut out, &Quoted);
++    push_escaped_attr(&mut out, &"\"");
++    assert_eq!(out, "<p>text3attribute&quot;");
++}

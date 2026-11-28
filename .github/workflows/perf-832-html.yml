@@ -1,0 +1,145 @@
+name: perf-832 phase 2 html
+
+# Rullst issue #832, phase 2 of the 13.1 performance work, direction 5 (html! rendering): paired before/after
+# measurements. Scratch workflow in the maintainer's fork; nothing here is published.
+# Before: the published crates.io release 13.0.0-rc.1. After: the published rullst-macros (html1) or rullst-macros and
+# rullst-core (html2) 13.0.0-rc.1 sources (SHA-256 checked) patched by perf-832/patches/, the diff of the Rullst branch
+# perf/v13-1-html-single-buffer against its merge base, whose html sources equal the 13.0.0-rc.1 crates.
+# Every variant of a job is built in that job; servers alternate every round.
+
+on:
+  push:
+    branches: [scratch/perf-832-html]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RULLST_VERSION: 13.0.0-rc.1
+  BENCH_SHA: 4dfa6b6267cd452d6cc3bd860a4d6a2a8972ccf9
+  # The merge base of perf/v13-1-html-single-buffer: its site/ is the html! consumer compile.sh builds.
+  RULLST_SHA: ca3793d71842e902df24c043e5399f59cde3c1ed
+
+jobs:
+  pair:
+    if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-pair]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Rullst/Benchmarks
+          ref: ${{ env.BENCH_SHA }}
+          path: benchmarks
+          persist-credentials: false
+      - name: Host
+        run: |
+          nproc; lscpu | grep -i "model name"; uname -a
+          sha256sum perf-832/patches/*.patch
+      - name: Build the before and after images in this job
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+          OUT: ${{ github.workspace }}/out/images
+        run: |
+          perf-832/build.sh rullst
+          perf-832/build.sh rullst-html1
+          perf-832/build.sh rullst-html2
+      - name: Setup (wrk, oha, heaptrack)
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+        run: |
+          perf-832/setup.sh oha
+          sudo apt-get update -qq
+          sudo apt-get install -y heaptrack
+          apt-cache policy heaptrack | head -3
+      - name: /fortunes, paired
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py throughput --path /fortunes --rounds 5
+          --variants rullst,html1,html2 --out out/fortunes.json
+      - name: /text, paired (no html! on this path)
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py throughput --path /text --rounds 5
+          --variants rullst,html1,html2 --out out/text.json
+      - name: Allocations per request (heaptrack, native binaries of the images, production environment)
+        if: success() || failure()
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+          RULLST_ENV: production
+        run: |
+          set -eu
+          mkdir -p bin
+          for name in rullst rullst-html1 rullst-html2; do cp "out/images/$name.server" "bin/$name"; done
+          chmod +x bin/*
+          python3 perf-832/drive.py alloc --bin bin --oha "$OHA" --out out/alloc \
+            --targets "rullst=/fortunes,html1=/fortunes,html2=/fortunes"
+          rm -f out/alloc/*.zst out/alloc/*.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: pair-${{ matrix.runner }}
+          path: |
+            out/*.json
+            out/alloc/
+            out/images/*.txt
+            out/images/*.sha256
+            out/images/*-bytes
+            out/images/*.build-seconds
+          retention-days: 30
+
+  htmlbench:
+    if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-htmlbench]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Render /fortunes with each variant, counting allocations, on one pinned CPU
+        run: perf-832/htmlbench.sh out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: htmlbench-${{ matrix.runner }}
+          path: out/
+          retention-days: 30
+
+  compile:
+    if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-compile]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Rullst/Rullst
+          ref: ${{ env.RULLST_SHA }}
+          path: rullst
+          persist-credentials: false
+      - name: Rust 1.99.1
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Website generator build time, size and output per variant
+        run: perf-832/compile.sh rullst out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: compile
+          path: out/
+          retention-days: 30

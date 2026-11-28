@@ -8,6 +8,7 @@ echo "WRK=$("$BENCH/bench/install-loadgen.sh" "$RUNNER_TEMP/bin")" >> "$GITHUB_E
 if [ "${1:-}" = oha ]; then
   echo "OHA=$("$BENCH/bench/install-loadgen.sh" "$RUNNER_TEMP/bin" oha)" >> "$GITHUB_ENV"
 fi
+shopt -s nullglob
 for tarball in images/*.tar.gz; do
   gunzip -c "$tarball" | docker load
 done
