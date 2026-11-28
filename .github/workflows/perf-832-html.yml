@@ -98,6 +98,60 @@ jobs:
             out/images/*.build-seconds
           retention-days: 30
 
+  extra:
+    if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-extra]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Rullst/Benchmarks
+          ref: ${{ env.BENCH_SHA }}
+          path: benchmarks
+          persist-credentials: false
+      - name: Host
+        run: |
+          nproc; lscpu | grep -i "model name"; uname -a
+          sha256sum perf-832/patches/*.patch
+      - name: Build the images in this job
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+          OUT: ${{ github.workspace }}/out/images
+        run: |
+          perf-832/build.sh rullst
+          perf-832/build.sh rullst-path
+          perf-832/build.sh rullst-html2
+          perf-832/build.sh rullst-minimal
+          perf-832/build.sh rullst-minimal-html2
+      - name: Setup (wrk)
+        env:
+          BENCH: ${{ github.workspace }}/benchmarks
+        run: perf-832/setup.sh
+      - name: /fortunes, paired (rullst, the path-crate control, html2, rullst-minimal before and after)
+        env:
+          BENCH_REPO: ${{ github.workspace }}/benchmarks
+        run: >-
+          python3 perf-832/drive.py throughput --path /fortunes --rounds 5
+          --variants rullst,path,html2,minimal,minimal-html2 --out out/fortunes-extra.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: extra-${{ matrix.runner }}
+          path: |
+            out/*.json
+            out/images/*.txt
+            out/images/*.sha256
+            out/images/*-bytes
+            out/images/*.build-seconds
+          retention-days: 30
+
   htmlbench:
     if: ${{ !contains(github.event.head_commit.message, '[only-') || contains(github.event.head_commit.message, '[only-htmlbench]') }}
     runs-on: ubuntu-24.04

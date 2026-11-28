@@ -75,6 +75,8 @@ VARIANTS: dict[str, tuple[str, str, dict]] = {
     # (html2) 13.0.0-rc.1 patched by perf-832/patches/ (perf-832/build.sh).
     "html1": ("rullst-html1", "rullst", {}),
     "html2": ("rullst-html2", "rullst", {}),
+    "path": ("rullst-path", "rullst", {}),
+    "minimal-html2": ("rullst-minimal-html2", "rullst-minimal", {}),
 }
 for part in ALL:
     VARIANTS[f"no-{part}"] = ("rullst-ablate", "rullst", {"RULLST_ABLATE": part})

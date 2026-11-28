@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Writes the patched crates a variant needs into DIR/crates (nothing for the unpatched "before").
-# Usage: crates.sh VARIANT DIR   VARIANT: rullst | rullst-html1 | rullst-html2 | rullst-html2-cap
+# Usage: crates.sh VARIANT DIR   VARIANT: rullst | rullst-path | rullst-html1 | rullst-html2 | rullst-html2-cap
+#   rullst-path        control: both published crates as path dependencies, not patched
 #   rullst-html2-cap   html2 with the expansion's first capacity raised to at least 2048 bytes: an experiment that
 #                      shows what the remaining reallocations cost; not a proposal and not in the Rullst branch.
 set -euo pipefail
@@ -21,6 +22,9 @@ fetch() {
 mkdir -p "$dir/crates"
 fetch rullst-macros f432fe7a4979208445ac5b9db06885ff3e411d4b221cd07aa03a05ea075779e1 "$dir/crates/rullst-macros"
 case "$variant" in
+  rullst-path)
+    fetch rullst-core b9a238e41ddf20b0fac6944f2ccb2429e3bcfb7de68ec972655230e1d99ac860 "$dir/crates/rullst-core"
+    ;;
   rullst-html1)
     (cd "$dir/crates/rullst-macros" && patch -p2 --batch --quiet < "$here/patches/html1-macros.patch")
     ;;

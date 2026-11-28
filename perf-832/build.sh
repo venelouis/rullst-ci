@@ -6,6 +6,8 @@
 #                  perf-832/patches/html1-macros.patch (one buffer; macro only, rullst-core as published)
 #   rullst-html2   the same with rullst-macros and rullst-core 13.0.0-rc.1 patched by html2-macros.patch and
 #                  html2-core.patch (one buffer, values written into it)
+#   rullst-path    control: rullst-macros and rullst-core 13.0.0-rc.1 as path dependencies, not patched
+#   rullst-minimal, rullst-minimal-html2   frameworks/rullst-minimal as it is, and with the html2 crates
 # The patches are the Rullst branch perf/v13-1-html-single-buffer against its merge base, whose rullst-macros and
 # rullst-core html sources equal the 13.0.0-rc.1 crates (both crates are SHA-256 checked).
 set -euo pipefail
@@ -15,9 +17,13 @@ RV=13.0.0-rc.1
 here="$(cd "$(dirname "$0")" && pwd)"
 work="$(mktemp -d)"
 mkdir -p "$OUT"
-cp -r "$BENCH/frameworks/rullst" "$work/ctx"
-"$here/crates.sh" "$name" "$work/ctx"
-if [ "$name" != rullst ]; then
+case "$name" in
+  rullst-minimal*) app=rullst-minimal; variant="rullst${name#rullst-minimal}";;
+  *) app=rullst; variant="$name";;
+esac
+cp -r "$BENCH/frameworks/$app" "$work/ctx"
+"$here/crates.sh" "$variant" "$work/ctx"
+if [ "$variant" != rullst ]; then
   {
     printf '\n[patch.crates-io]\nrullst-macros = { path = "crates/rullst-macros" }\n'
     if [ -d "$work/ctx/crates/rullst-core" ]; then
